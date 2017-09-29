@@ -77,7 +77,7 @@ mod headless_chrome
 		{
 			self.receiver.recv_message::<DummyIterator>()
 		}
-		pub fn wait_event<E: Event>(&mut self) -> WebSocketResult<E>
+		pub fn wait_event<E: Event>(&mut self) -> GenericResult<E>
 		{
 			loop
 			{
@@ -98,6 +98,11 @@ mod headless_chrome
 							{
 								return Ok(E::deserialize(&parsed.get("params").unwrap()));
 							}
+						}
+						else if let Some(e) = parsed.get("error")
+						{
+							return Err(From::from(format!("RPC Error({}): {} in processing id {}", e["code"].as_i64().unwrap(),
+								e["message"].as_str().unwrap(), parsed["id"].as_u64().unwrap())));
 						}
 					},
 					_ => ()
@@ -222,7 +227,6 @@ mod headless_chrome
 			const METHOD_NAME: &'static str = "Page.frameNavigated";
 			fn deserialize(res: &JValue) -> Self
 			{
-				println!("FrameNavigated: {:?}", res);
 				FrameNavigated
 				{
 					frame_id: res["frame"]["id"].as_str().unwrap().to_owned(),
@@ -555,6 +559,7 @@ fn main()
 			session.wait_event::<headless_chrome::page::LoadEventFired>().unwrap();
 			page_location = session.runtime().evaluate_sync(2, "location.href").unwrap()["result"]["value"].as_str().unwrap().to_owned();
 		}
+		println!("履修ページへアクセスしています...");
 		// println!("Navigated: {}", page_location);
 		// "履修・成績・出席"リンクを処理
 		// 将来的にmenuBlockクラスが複数出てきたらまた考えます
@@ -570,19 +575,20 @@ fn main()
 		let main_frame = restree["frameTree"]["childFrames"].as_array().unwrap().iter().find(|e| e["frame"]["name"] == "MainFrame").unwrap();
 		session.page().navigate_sync(12, main_frame["frame"]["url"].as_str().unwrap()).unwrap();
 		session.wait_event::<headless_chrome::page::LoadEventFired>().unwrap();
-		let course_link_path = "a#dgSystem__ctl2_lbtnSystemName";
+		session.runtime().evaluate(16, r#"document.querySelector('a#dgSystem__ctl2_lbtnSystemName').click()"#).unwrap();
+		/*let course_link_path = "a#dgSystem__ctl2_lbtnSystemName";
 		let course_link_attrs = session.dom().get_root_node_sync(13).unwrap().query_selector(course_link_path).unwrap().attributes().unwrap();
 		// session.input().dispatch_key_event_sync(6, headless_chrome::input::KeyEvent::Char, Some("\r")).unwrap();
 		let href_index = course_link_attrs.iter().enumerate().find(|&(_, s)| s == "href").map(|(i, _)| i + 1).unwrap();
-		session.page().navigate_sync(14, course_link_attrs[href_index].as_str().unwrap()).unwrap();
+		session.page().navigate_sync(14, course_link_attrs[href_index].as_str().unwrap()).unwrap();*/
 		// onloadでコンテンツが読み込まれるので先に待つ
 		session.wait_event::<headless_chrome::page::LoadEventFired>().unwrap();
-		// 特定のフレームのロードを横取りする
-		let mut frame_nav_begin = Default::default();
+		// 特定のフレームのロードを横取りする -> ほしいフレームだけ表示して操作
+		let mut frame_nav_begin = session.wait_event::<headless_chrome::page::FrameNavigated>().unwrap();
 		loop
 		{
-			frame_nav_begin = session.wait_event::<headless_chrome::page::FrameNavigated>().unwrap();
 			if frame_nav_begin.name.as_ref().map(|x| x == "MainFrame").unwrap_or(false) { break; }
+			frame_nav_begin = session.wait_event::<headless_chrome::page::FrameNavigated>().unwrap();
 		}
 		session.page().navigate_sync(15, &frame_nav_begin.url).unwrap();
 		session.wait_event::<headless_chrome::page::LoadEventFired>().unwrap();
@@ -636,6 +642,8 @@ fn main()
 		//   - ちなみに2番目の科目名と3番目は別の行に見えて同一のtd(tr)内(なぜ)
 		//   - 空のセルにも1番目のtableだけ入ってる(自動生成の都合っぽい感じ)
 		//     - これのおかげで若干空きセルに立体感が出る（？
+
+		// 下のスクリプトで得られるデータは行優先です(0~5が1限、6~11が2限といった感じ)
 		let course_table = match session.runtime().evaluate_value_sync(21, r#"
 			var tables = document.querySelectorAll('table.rishu-tbl-cell');
 			// 前半クォーターは3、後半クォーターは5
@@ -696,8 +704,6 @@ fn main()
 			// std::io::stdin().read(&mut [0]).unwrap();
 		}*/
 	}
-	println!("Connection closed");
-	std::io::stdin().read(&mut [0]).unwrap();
 }
 
 fn prompt(text: &str) -> String
