@@ -489,7 +489,7 @@ mod headless_chrome
 		pub fn run(port: u16, initial_url: &str) -> IOResult<Self>
 		{
 			#[cfg(windows)] const CHROME_DEFAULT_BIN: &'static str = r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe";
-			#[cfg(linux)]   const CHROME_DEFAULT_BIN: &'static str = "google-chrome-stable";
+			#[cfg(unix)]    const CHROME_DEFAULT_BIN: &'static str = "google-chrome-stable";
 
 			let chrome_bin = ::std::env::var("CHROME_BIN").unwrap_or_else(|_|
 			{
@@ -583,9 +583,7 @@ impl RemoteCampus
 	pub fn click_element(&mut self, selector: &str) -> GenericResult<&mut Self>
 	{
 		let id = self.new_request_id();
-		// うごかないほう
-		// self.session.runtime().evaluate_sync(id, &format!(r#"var ev = document.createEvent("MouseEvent"); ev.initEvent("click", false, false); document.querySelector("{}").dispatchEvent(ev);"#, selector)).map(discard)
-		self.session.runtime().evaluate_sync(id, &format!(r#"document.querySelector("{}").click()"#, selector)).map(move |_| self)
+		self.session.runtime().evaluate_sync(id, &format!(r#"document.querySelector({:?}).click()"#, selector)).map(move |_| self)
 	}
 	pub fn jump_to_anchor_href(&mut self, selector: &str) -> GenericResult<&mut Self>
 	{
@@ -870,11 +868,11 @@ fn prompt(text: &str) -> String
 }
 
 // platform dependent - POSIX(Linux)
-#[cfg(linux)]
+#[cfg(unix)]
 extern crate termios;
-#[cfg(linux)]
+#[cfg(unix)]
 const STDIN_FD: std::os::unix::io::RawFd = 0;
-#[cfg(linux)]
+#[cfg(unix)]
 fn disable_echo()
 {
 	use termios::Termios;
@@ -882,7 +880,7 @@ fn disable_echo()
 	tio.c_lflag &= !termios::ECHO;
 	termios::tcsetattr(STDIN_FD, termios::TCSANOW, &tio).unwrap();
 }
-#[cfg(linux)]
+#[cfg(unix)]
 fn enable_echo()
 {
 	use termios::Termios;
