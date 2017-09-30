@@ -85,7 +85,7 @@ mod headless_chrome
 				{
 					OwnedMessage::Text(s) =>
 					{
-						// println!("[wait_event]Received: {}", s);
+						#[cfg(feature = "verbose")] println!("[wait_event]Received: {}", s);
 						// let obj: HashMap<_, _> = ::json_flex::decode(s).unwrap();
 						let parsed: JValue = serde_json::from_str(&s).unwrap();
 						if let Some(mtd) = parsed.get("method").and_then(JValue::as_str)
@@ -117,7 +117,7 @@ mod headless_chrome
 				{
 					OwnedMessage::Text(s) =>
 					{
-						// println!("[wait_result]Received: {}", s);
+						#[cfg(feature = "verbose")] println!("[wait_result]Received: {}", s);
 						// let mut obj: HashMap<_, _> = ::json_flex::decode(s).unwrap();
 						let mut parser: ::serde_json::Value = ::serde_json::from_str(&s).unwrap();
 						let obj = parser.as_object_mut().unwrap();
@@ -508,12 +508,15 @@ fn main()
 	};
 	println!("Session URLs: {:?}", session_list);
 
+	// println!("Ready to connect {}", session_list[0]); std::io::stdout().flush().unwrap();
+	// std::io::stdin().read(&mut [0]).unwrap();
 	println!("Connecting {}...", session_list[0]);
 	{
 		let mut session = headless_chrome::Session::connect(&session_list[0]).expect("Failed to connect to a session in the Headless Chrome");
+		println!("  Connection established.");
 		session.page().enable(0).unwrap(); session.wait_result(0).unwrap();
 		session.dom().enable(0).unwrap(); session.wait_result(0).unwrap();
-		session.wait_event::<headless_chrome::page::LoadEventFired>().unwrap();
+		// session.wait_event::<headless_chrome::page::LoadEventFired>().unwrap();
 		let result_location = session.runtime().evaluate_sync(2, "location.href").unwrap();
 		// let result = session.runtime().evaluate_sync(2, "document.querySelector('title').textContent").unwrap();
 		let mut page_location = result_location["result"]["value"].as_str().unwrap().to_owned();
@@ -521,7 +524,7 @@ fn main()
 		{
 			String::from_utf16(&[u16::from_str_radix(&cap[1], 16).unwrap()]).unwrap()
 		});*/
-		// println!("Location: {}", page_location); println!("Page Title: {}", page_title);
+		// println!("Location: {}", page_location); // println!("Page Title: {}", page_title);
 		if page_location.contains("campuslogin")
 		{
 			// println!("Logging-in required for DigitalCampus");
@@ -683,8 +686,19 @@ fn main()
 			},
 			_ => panic!("Unexpected value type returned")
 		};
-		println!("CourseTable FirstQuarter: {:?}", course_table[0]);
-		println!("CourseTable LastQuarter: {:?}", course_table[1]);
+
+		#[derive(Serialize)] #[serde(rename_all = "camelCase")] struct CourseTable
+		{
+			first_quarter: Vec<Vec<String>>, last_quarter: Vec<Vec<String>>
+		}
+		println!("{}", serde_json::to_string(&CourseTable
+		{
+			first_quarter: course_table[0].chunks(6).map(|x| x.to_owned()).collect(),
+			last_quarter: course_table[1].chunks(6).map(|x| x.to_owned()).collect()
+		}).unwrap());
+
+		// println!("CourseTable FirstQuarter: {:?}", course_table[0]);
+		// println!("CourseTable LastQuarter: {:?}", course_table[1]);
 		
 		/*
 		// vvv Experimental環境で有効(だとおもわれる) vvv

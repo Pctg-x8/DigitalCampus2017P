@@ -3,6 +3,9 @@ name = "digitalCampusScraper"
 version = "0.1.0"
 authors = ["S.Percentage <Syn.Tri.Naga@gmail.com>"]
 
+[features]
+verbose = []
+
 [dependencies]
 tokio-core = "0.1"
 futures = "0.1"
