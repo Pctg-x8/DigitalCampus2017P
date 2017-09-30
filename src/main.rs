@@ -830,12 +830,13 @@ fn main()
 
 		// 学生プロファイルと履修科目テーブル
 		let profile = dc.parse_profile().unwrap();
-		println!("=== 学生プロファイル ===");
+		/*println!("=== 学生プロファイル ===");
 		println!("** 学籍番号: {}", profile.id);
 		println!("** 氏名: {}", profile.name);
 		println!("** 学部/学年: {} {}", profile.course, profile.grade);
 		println!("** セメスタ: {}", profile.semester);
-		println!("** 住所: {}", profile.address.join(" "));
+		println!("** 住所: {}", profile.address.join(" "))*/
+		println!("{}", serde_json::to_string(&profile).unwrap());
 		println!("{}", serde_json::to_string(&dc.parse_course_table().unwrap()).unwrap());
 
 		/*
