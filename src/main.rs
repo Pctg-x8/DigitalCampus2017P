@@ -14,6 +14,14 @@ use tokio_core::reactor::Core;
 use futures::{Future, Stream};
 use std::io::prelude::*;
 use regex::*;
+use std::error::Error;
+
+type GenericResult<T> = Result<T, Box<Error>>;
+
+macro_rules! api_corruption
+{
+	(value_type) => (panic!("Unexpected value type returned. the API may be corrupted"))
+}
 
 /// An interface to the Headless Chrome
 mod headless_chrome
@@ -28,11 +36,9 @@ mod headless_chrome
 	use std::process::{Child, Command};
 	use std::io::prelude::{Write, Read};
 	use std::net::TcpStream;
-	use std::error::Error;
 	use std::io::{Result as IOResult, ErrorKind as IOErrorKind};
 	use serde_json::Value as JValue; use serde_json;
-
-	type GenericResult<T> = Result<T, Box<Error>>;
+	use GenericResult;
 
 	/// `json/version` response
 	#[derive(Deserialize)]
@@ -57,14 +63,40 @@ mod headless_chrome
 		fn next(&mut self) -> Option<Self::Item> { None }
 	}
 
-	pub struct Session<W: Write, R: Read> { sender: WebSocketWriter<W>, receiver: WebSocketReader<R> }
+	pub trait SessionEventSubscriber<E: Event>
+	{
+		fn on_event(&mut self, event: &E);
+	}
+	impl<F, E: Event> SessionEventSubscriber<E> for F where F: FnMut(&E)
+	{
+		fn on_event(&mut self, event: &E) { self(event) }
+	}
+	pub trait SessionEventSubscribable<E: Event>
+	{
+		unsafe fn subscribe_session_event_raw(&mut self, subscriber: *mut SessionEventSubscriber<E>);
+		unsafe fn unsubscribe_session_event_raw(&mut self, subscriber: *mut SessionEventSubscriber<E>);
+		fn subscribe_session_event(&mut self, subscriber: &SessionEventSubscriber<E>)
+		{
+			unsafe { self.subscribe_session_event_raw(subscriber as *const _ as *mut _) }
+		}
+		fn unsubscribe_session_event(&mut self, subscriber: &SessionEventSubscriber<E>)
+		{
+			unsafe { self.unsubscribe_session_event_raw(subscriber as *const _ as *mut _) }
+		}
+	}
+
+	pub struct Session<W: Write, R: Read>
+	{
+		sender: WebSocketWriter<W>, receiver: WebSocketReader<R>,
+		frame_navigated_event_subscriber: Vec<*mut SessionEventSubscriber<page::FrameNavigated>>
+	}
 	impl Session<TcpStream, TcpStream>
 	{
-		pub fn connect(addr: &str) -> Result<Self, Box<Error>>
+		pub fn connect(addr: &str) -> GenericResult<Self>
 		{
 			let ws_client = ClientBuilder::new(addr)?.connect_insecure()?;
 			let (recv, send) = ws_client.split()?;
-			Ok(Session { sender: send, receiver: recv })
+			Ok(Session { sender: send, receiver: recv, frame_navigated_event_subscriber: Vec::new() })
 		}
 	}
 	impl<W: Write, R: Read> Session<W, R>
@@ -73,6 +105,21 @@ mod headless_chrome
 		pub fn input(&mut self) -> domain::Input<W, R> { domain::Input(self) }
 		pub fn page(&mut self) -> domain::Page<W, R> { domain::Page(self) }
 		pub fn runtime(&mut self) -> domain::Runtime<W, R> { domain::Runtime(self) }
+	}
+	impl<W: Write, R: Read> SessionEventSubscribable<page::FrameNavigated> for Session<W, R>
+	{
+		unsafe fn subscribe_session_event_raw(&mut self, subscriber: *mut SessionEventSubscriber<page::FrameNavigated>)
+		{
+			self.frame_navigated_event_subscriber.push(subscriber);
+		}
+		unsafe fn unsubscribe_session_event_raw(&mut self, subscriber: *mut SessionEventSubscriber<page::FrameNavigated>)
+		{
+			let index = self.frame_navigated_event_subscriber.iter().position(|&x| x == subscriber).expect("Already unsubscribed?");
+			self.frame_navigated_event_subscriber.remove(index);
+		}
+	}
+	impl<W: Write, R: Read> Session<W, R>
+	{
 		pub fn wait_message(&mut self) -> WebSocketResult<OwnedMessage>
 		{
 			self.receiver.recv_message::<DummyIterator>()
@@ -90,9 +137,10 @@ mod headless_chrome
 						let parsed: JValue = serde_json::from_str(&s).unwrap();
 						if let Some(mtd) = parsed.get("method").and_then(JValue::as_str)
 						{
-							if mtd == "Page.frameNavigated"
+							if mtd == page::FrameNavigated::METHOD_NAME
 							{
-								println!("** Navigation Request: {}", parsed["params"]["frame"]["url"].as_str().unwrap());
+								let e = page::FrameNavigated::deserialize(&parsed.get("params").unwrap());
+								for &call in &self.frame_navigated_event_subscriber { unsafe { &mut *call }.on_event(&e); }
 							}
 							if mtd == E::METHOD_NAME
 							{
@@ -127,9 +175,10 @@ mod headless_chrome
 						}
 						else if let Some(mtd) = obj.get("method").and_then(JValue::as_str)
 						{
-							if mtd == "Page.frameNavigated"
+							if mtd == page::FrameNavigated::METHOD_NAME
 							{
-								println!("** Navigation Request: {}", obj["params"]["frame"]["url"].as_str().unwrap());
+								let e = page::FrameNavigated::deserialize(&obj.get("params").unwrap());
+								for &call in &self.frame_navigated_event_subscriber { unsafe { &mut *call }.on_event(&e); }
 							}
 						}
 						else if let Some(e) = obj.get("error")
@@ -191,9 +240,9 @@ mod headless_chrome
 					::serde_json::Value::Object(mut o) => match o.remove("attributes")
 					{
 						Some(::serde_json::Value::Array(v)) => v,
-						_ => panic!("Unexpected value type returned")
+						_ => api_corruption!(value_type)
 					},
-					_ => panic!("Unexpected value type returned")
+					_ => api_corruption!(value_type)
 				})
 			}
 		}
@@ -310,9 +359,9 @@ mod headless_chrome
 					::serde_json::Value::Object(mut o) => match o.remove("nodeIds")
 					{
 						Some(::serde_json::Value::Array(v)) => v,
-						_ => panic!("Unexpected value type returned")
+						_ => api_corruption!(value_type)
 					},
-					_ => panic!("Unexpected value type returned")
+					_ => api_corruption!(value_type)
 				})
 			}
 			pub fn focus_sync(&mut self, id: usize, node_id: isize) -> super::GenericResult<()>
@@ -484,12 +533,225 @@ mod headless_chrome
 	}
 }
 
+fn discard<T>(_: T) { () }
+
+use headless_chrome::{SessionEventSubscriber, SessionEventSubscribable};
+
+pub type TcpSession = headless_chrome::Session<std::net::TcpStream, std::net::TcpStream>;
+
+use std::sync::atomic::{Ordering, AtomicUsize};
+pub struct RemoteCampus { session: TcpSession, request_id: AtomicUsize }
+impl RemoteCampus
+{
+	pub fn connect(addr: &str) -> GenericResult<Self>
+	{
+		let mut object = headless_chrome::Session::connect(addr).map(|session| RemoteCampus { session, request_id: AtomicUsize::new(1) })?;
+		let objptr = &object as &SessionEventSubscriber<_> as *const _ as *mut _;
+		unsafe { object.session.subscribe_session_event_raw(objptr) };
+		object.session.page().enable(0).unwrap(); object.session.wait_result(0).unwrap();
+		object.session.dom().enable(0).unwrap(); object.session.wait_result(0).unwrap();
+		Ok(object)
+	}
+	fn new_request_id(&self) -> usize { self.request_id.fetch_add(1, Ordering::SeqCst) }
+
+	pub fn query_page_location(&mut self) -> GenericResult<String>
+	{
+		let id = self.new_request_id();
+		self.session.runtime().evaluate_sync(id, "location.href").map(|m| match m
+		{
+			serde_json::Value::Object(mut o) => match o.remove("result")
+			{
+				Some(serde_json::Value::Object(mut vo)) => match vo.remove("value")
+				{
+					Some(serde_json::Value::String(s)) => s,
+					_ => api_corruption!(value_type)
+				},
+				_ => api_corruption!(value_type)
+			},
+			_ => api_corruption!(value_type)
+		})
+	}
+	pub fn is_in_login_page(&mut self) -> GenericResult<bool>
+	{
+		self.query_page_location().map(|l| l.contains("/campuslogin"))
+	}
+	pub fn is_in_home(&mut self) -> GenericResult<bool>
+	{
+		self.query_page_location().map(|l| l.contains("/campusHomepage"))
+	}
+
+	pub fn click_element(&mut self, selector: &str) -> GenericResult<&mut Self>
+	{
+		let id = self.new_request_id();
+		// うごかないほう
+		// self.session.runtime().evaluate_sync(id, &format!(r#"var ev = document.createEvent("MouseEvent"); ev.initEvent("click", false, false); document.querySelector("{}").dispatchEvent(ev);"#, selector)).map(discard)
+		self.session.runtime().evaluate_sync(id, &format!(r#"document.querySelector("{}").click()"#, selector)).map(move |_| self)
+	}
+	pub fn jump_to_anchor_href(&mut self, selector: &str) -> GenericResult<&mut Self>
+	{
+		let id = self.new_request_id(); let id2 = self.new_request_id();
+		let intersys_link_attrs = self.session.dom().get_root_node_sync(id)?.query_selector(selector)?.attributes()?;
+		let href_index = intersys_link_attrs.iter().position(|s| s == "href").unwrap() + 1;
+		self.session.page().navigate_sync(id2, intersys_link_attrs[href_index].as_str().unwrap()).map(move |_| self)
+	}
+	pub fn sync_load(&mut self, new_location: &str) -> GenericResult<&mut Self>
+	{
+		let id = self.new_request_id();
+		self.session.page().navigate_sync(id, new_location)?; self.sync()
+	}
+
+	/// synchronize page
+	pub fn sync(&mut self) -> GenericResult<&mut Self>
+	{
+		self.session.wait_event::<headless_chrome::page::LoadEventFired>().map(move |_| self)
+	}
+	
+	const LOGINFORM_NAME_ID: &'static str = "loginPage:formId:j_id33";
+	pub fn set_login_id_field(&mut self, login_id: &str) -> GenericResult<()>
+	{
+		let id = self.new_request_id();
+		self.session.runtime().evaluate_sync(id, &format!(r#"document.querySelector('input[name="{}"]').value = "{}";"#, Self::LOGINFORM_NAME_ID, login_id)).map(discard)
+	}
+}
+impl SessionEventSubscriber<headless_chrome::page::FrameNavigated> for RemoteCampus
+{
+	fn on_event(&mut self, event: &headless_chrome::page::FrameNavigated)
+	{
+		println!("FrameNavigated: {}", event.url);
+	}
+}
+/*impl Drop for RemoteCampus
+{
+	fn drop(&mut self)
+	{
+		let objptr = self as &SessionEventSubscriber<_> as *const _ as *mut _;
+		unsafe { self.session.unsubscribe_session_event_raw(objptr); }
+	}
+}*/
+
+/// 学生プロファイル
+#[derive(Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
+pub struct StudentProfile
+{
+	#[doc = "学籍番号"] pub id: String,
+	#[doc = "名前"] pub name: String,
+	#[doc = "学部"] pub course: String,
+	#[doc = "学年(年込み)"] pub grade: String,
+	#[doc = "セメスタ(よくわからん)"] pub semester: String,
+	#[doc = "住所"] pub address: Vec<String>
+}
+/// 履修科目テーブル
+#[derive(Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
+pub struct CourseTable
+{
+	#[doc = "前半クォーター"] pub first_quarter: Vec<Vec<String>>,
+	#[doc = "後半クォーター"]  pub last_quarter: Vec<Vec<String>>
+}
+
+/// 学生プロファイル/履修データの解析周り
+impl RemoteCampus
+{
+	/// 学生プロファイルテーブルの解析　　
+	/// セルで罫線を表現するというわけのわからない仕組みのため偶数行だけ取るようにしてる　　
+	/// 奇数列は項目の名前("学籍番号"とか)
+	pub fn parse_profile(&mut self) -> GenericResult<StudentProfile>
+	{
+		let id = self.new_request_id();
+		let profile_rows_data = self.session.runtime().evaluate_value_sync(id,
+			r#"Array.prototype.map.call(document.querySelectorAll('#TableProfile tr:nth-child(2n) td:nth-child(2n)'), function(x){ return x.textContent; })"#)?;
+		let regex_replace_encoded = Regex::new(r"\\u\{([0-9a-fA-F]{4})\}").unwrap();
+		let mut profile_rows: Vec<_> = match profile_rows_data
+		{
+			serde_json::Value::Object(mut pro) => match pro.remove("result")
+			{
+				Some(serde_json::Value::Object(mut ro)) => match ro.remove("value")
+				{
+					Some(serde_json::Value::Array(va)) => va.into_iter().map(|v| match v
+					{
+						serde_json::Value::String(s) => regex_replace_encoded.replace_all(s.trim(), |cap: &Captures|
+						{
+							String::from_utf16(&[u16::from_str_radix(&cap[1], 16).unwrap()]).unwrap()
+						}).into_owned(),
+						_ => api_corruption!(value_type)
+					}).collect(),
+					_ => api_corruption!(value_type)
+				},
+				_ => api_corruption!(value_type)
+			},
+			_ => api_corruption!(value_type)
+		};
+
+		Ok(StudentProfile
+		{
+			id: profile_rows.remove(0), name: profile_rows.remove(0),
+			course: profile_rows.remove(0), grade: profile_rows.remove(0),
+			semester: profile_rows.remove(0), address: profile_rows
+		})
+	}
+	/// 履修テーブル(前半クォーター分だけ)の取得(クラス名の段階でわかるけどこれで3Q4Qどっちも取れる)
+	/// ## †履修テーブルの仕組み†
+	/// - 科目名が入るところは全部rishu-tbl-cellクラスっぽい(科目が入ってるところはbackground-colorスタイルが指定されて白くなっている)
+	/// - 科目があるセルはなんと3重table構造(はじめて見た)
+	///   - 外側のtableは周囲に1pxの空きをつくるためのもの？
+	///   - 2番目のtableが実際のコンテンツレイアウト
+	///   - 3番目のtableは科目の詳細(2番目のtableにまとめられそうだけど)
+	///   - ちなみに2番目の科目名と3番目は別の行に見えて同一のtd(tr)内(なぜ)
+	///   - 空のセルにも1番目のtableだけ入ってる(自動生成の都合っぽい感じ)
+	///     - これのおかげで若干空きセルに立体感が出る（？
+	pub fn parse_course_table(&mut self) -> GenericResult<CourseTable>
+	{
+		// 下のスクリプトで得られるデータは行優先です(0~5が1限、6~11が2限といった感じ)
+		let id = self.new_request_id();
+		let course_table = match self.session.runtime().evaluate_value_sync(id, r#"
+			var tables = document.querySelectorAll('table.rishu-tbl-cell');
+			// 前半クォーターは3、後半クォーターは5
+			var q1_koma_cells = tables[3].querySelectorAll('td.rishu-tbl-cell');
+			var q2_koma_cells = tables[5].querySelectorAll('td.rishu-tbl-cell');
+			[Array.prototype.map.call(q1_koma_cells, function(k)
+			{
+				var title_link = k.querySelector('a');
+				if(!title_link) return null; else return title_link.textContent;
+			}), Array.prototype.map.call(q2_koma_cells, function(k)
+			{
+				var title_link = k.querySelector('a');
+				if(!title_link) return null; else return title_link.textContent;
+			})]
+		"#)?
+		{
+			serde_json::Value::Object(mut ro) => match ro.remove("result")
+			{
+				Some(serde_json::Value::Object(mut vo)) => match vo.remove("value")
+				{
+					Some(serde_json::Value::Array(v)) => v.into_iter().map(|v| match v
+					{
+						serde_json::Value::Array(vi) => vi.into_iter().map(|vs| match vs
+						{
+							serde_json::Value::Null => String::new(),
+							serde_json::Value::String(s) => s,
+							_ => api_corruption!(value_type)
+						}).collect(),
+						_ => api_corruption!(value_type)
+					}).collect::<Vec<Vec<_>>>(),
+					_ => api_corruption!(value_type)
+				},
+				_ => api_corruption!(value_type)
+			},
+			_ => api_corruption!(value_type)
+		};
+
+		Ok(CourseTable
+		{
+			first_quarter: course_table[0].chunks(0).map(ToOwned::to_owned).collect(),
+			last_quarter: course_table[1].chunks(1).map(ToOwned::to_owned).collect()
+		})
+	}
+}
+
 fn main()
 {
 	println!("DigitalCampus 2017 Prototype");
 
-	let chrome = headless_chrome::Process::run(9222, "https://dh.force.com/digitalCampus/campusHomepage")
-		.expect("Failed to launch the Headless Chrome");
+	let chrome = headless_chrome::Process::run(9222, "https://dh.force.com/digitalCampus/campusHomepage").expect("Failed to launch the Headless Chrome");
 
 	let mut tcore = Core::new().expect("Failed to initialize tokio-core");
 	let client = hyper::Client::new(&tcore.handle());
@@ -506,200 +768,76 @@ fn main()
 		let list_js = json_flex::decode(String::from_utf8_lossy(&buffer).into_owned());
 		list_js.into_vec().expect("Expeting Array").into_iter().map(|x| x["webSocketDebuggerUrl"].into_string().unwrap().clone()).collect::<Vec<_>>()
 	};
-	println!("Session URLs: {:?}", session_list);
+	// println!("Session URLs: {:?}", session_list);
 
-	// println!("Ready to connect {}", session_list[0]); std::io::stdout().flush().unwrap();
-	// std::io::stdin().read(&mut [0]).unwrap();
 	println!("Connecting {}...", session_list[0]);
 	{
-		let mut session = headless_chrome::Session::connect(&session_list[0]).expect("Failed to connect to a session in the Headless Chrome");
+		let mut dc = RemoteCampus::connect(&session_list[0]).expect("Failed to connect to a session in the Headless Chrome");
 		println!("  Connection established.");
-		session.page().enable(0).unwrap(); session.wait_result(0).unwrap();
-		session.dom().enable(0).unwrap(); session.wait_result(0).unwrap();
-		// session.wait_event::<headless_chrome::page::LoadEventFired>().unwrap();
-		let result_location = session.runtime().evaluate_sync(2, "location.href").unwrap();
-		// let result = session.runtime().evaluate_sync(2, "document.querySelector('title').textContent").unwrap();
-		let mut page_location = result_location["result"]["value"].as_str().unwrap().to_owned();
-		/*let page_title = Regex::new(r"\\u([0-9a-fA-F]{4})").unwrap().replace_all(result["result"]["value"].as_str().unwrap(), |cap: &Captures|
-		{
-			String::from_utf16(&[u16::from_str_radix(&cap[1], 16).unwrap()]).unwrap()
-		});*/
-		// println!("Location: {}", page_location); // println!("Page Title: {}", page_title);
-		if page_location.contains("campuslogin")
+		if dc.is_in_login_page().unwrap()
 		{
 			// println!("Logging-in required for DigitalCampus");
 			println!("デジキャンへのログインが必要です。");
-		}
-		while page_location.contains("campuslogin")
-		{
-			// Logging-in required
-			// let id = prompt("Student Number");
-			let id = prompt("学籍番号");
-			disable_echo(); let pass = prompt(/*"Password"*/"パスワード"); enable_echo(); println!();
-			// println!("Logging in as {}...", id.trim_right());
-			println!("ログイン処理中です({})...", id.trim_right());
-			// println!("Requesting {} {}", id.trim_right(), pass.trim_right());
-			session.runtime().evaluate_sync(3, r#"document.querySelector('input[name="loginPage:formId:j_id33"]').value = "";"#).unwrap();
-			session.dom().get_root_node_sync(4).unwrap().query_selector(r#"input[name="loginPage:formId:j_id33"]"#).unwrap().focus().unwrap();
-			for c in id.trim_right().chars()
+			loop
 			{
-				session.input().dispatch_key_event_sync(5, headless_chrome::input::KeyEvent::Char, Some(&c.to_string())).unwrap();
-			}
-			session.dom().get_root_node_sync(4).unwrap().query_selector(r#"input[name="loginPage:formId:j_id34"]"#).unwrap().focus().unwrap();
-			for c in pass.trim_right().chars()
-			{
-				session.input().dispatch_key_event_sync(6, headless_chrome::input::KeyEvent::Char, Some(&c.to_string())).unwrap();
-			}
-			// press enter to login
-			session.input().dispatch_key_event_sync(6, headless_chrome::input::KeyEvent::Char, Some("\r")).unwrap();
-			session.wait_event::<headless_chrome::page::LoadEventFired>().unwrap();
-			page_location = session.runtime().evaluate_sync(2, "location.href").unwrap()["result"]["value"].as_str().unwrap().to_owned();
-			if page_location.contains("campuslogin")
-			{
-				// println!("** Failed to login to DigitalCampus. Check whether Student Number or password is correct **");
-				println!("** デジキャンへのログインに失敗しました。学籍番号またはパスワードが正しいか確認してください。 **");
+				// Logging-in required
+				// let id = prompt("Student Number");
+				let id = prompt("学籍番号");
+				disable_echo(); let pass = prompt(/*"Password"*/"パスワード"); enable_echo(); println!();
+				// println!("Logging in as {}...", id.trim_right());
+				println!("ログイン処理中です({})...", id.trim_right());
+				dc.set_login_id_field(id.trim_right()).unwrap();
+				dc.session.dom().get_root_node_sync(4).unwrap().query_selector(r#"input[name="loginPage:formId:j_id34"]"#).unwrap().focus().unwrap();
+				for c in pass.trim_right().chars()
+				{
+					dc.session.input().dispatch_key_event_sync(6, headless_chrome::input::KeyEvent::Char, Some(&c.to_string())).unwrap();
+				}
+				// press enter to login
+				dc.session.input().dispatch_key_event_sync(6, headless_chrome::input::KeyEvent::Char, Some("\r")).unwrap();
+				dc.session.wait_event::<headless_chrome::page::LoadEventFired>().unwrap();
+				if dc.is_in_login_page().unwrap()
+				{
+					// println!("** Failed to login to DigitalCampus. Check whether Student Number or password is correct **");
+					println!("** デジキャンへのログインに失敗しました。学籍番号またはパスワードが正しいか確認してください。 **");
+				}
+				else { break; }
 			}
 		}
-		while !page_location.contains("/campusHomepage")
-		{
-			session.wait_event::<headless_chrome::page::LoadEventFired>().unwrap();
-			page_location = session.runtime().evaluate_sync(2, "location.href").unwrap()["result"]["value"].as_str().unwrap().to_owned();
-		}
+		while !dc.is_in_home().unwrap() { dc.session.wait_event::<headless_chrome::page::LoadEventFired>().unwrap(); }
 		println!("履修ページへアクセスしています...");
-		// println!("Navigated: {}", page_location);
 		// "履修・成績・出席"リンクを処理
 		// 将来的にmenuBlockクラスが複数出てきたらまた考えます
-		let intersys_link_path = "#gnav ul li.menuBlock ul li:first-child a";
-		let intersys_link_attrs = session.dom().get_root_node_sync(8).unwrap().query_selector(intersys_link_path).unwrap().attributes().unwrap();
-		let href_index = intersys_link_attrs.iter().enumerate().find(|&(_, s)| s == "href").map(|(i, _)| i + 1).unwrap();
-		session.page().navigate_sync(9, intersys_link_attrs[href_index].as_str().unwrap()).unwrap();
-		session.wait_event::<headless_chrome::page::LoadEventFired>().unwrap();
+		dc.jump_to_anchor_href("#gnav ul li.menuBlock ul li:first-child a").unwrap().sync().unwrap();
 		// session.wait_event::<headless_chrome::dom::DocumentUpdated>().unwrap();
 
 		// CampusPlanのほうは昔なつかしframesetで構成されているのでほしいフレームの中身に移動する
-		let restree = session.page().get_resource_tree_sync(11).unwrap();
+		let restree = dc.session.page().get_resource_tree_sync(11).unwrap();
 		let main_frame = restree["frameTree"]["childFrames"].as_array().unwrap().iter().find(|e| e["frame"]["name"] == "MainFrame").unwrap();
-		session.page().navigate_sync(12, main_frame["frame"]["url"].as_str().unwrap()).unwrap();
-		session.wait_event::<headless_chrome::page::LoadEventFired>().unwrap();
-		session.runtime().evaluate(16, r#"document.querySelector('a#dgSystem__ctl2_lbtnSystemName').click()"#).unwrap();
-		/*let course_link_path = "a#dgSystem__ctl2_lbtnSystemName";
-		let course_link_attrs = session.dom().get_root_node_sync(13).unwrap().query_selector(course_link_path).unwrap().attributes().unwrap();
-		// session.input().dispatch_key_event_sync(6, headless_chrome::input::KeyEvent::Char, Some("\r")).unwrap();
-		let href_index = course_link_attrs.iter().enumerate().find(|&(_, s)| s == "href").map(|(i, _)| i + 1).unwrap();
-		session.page().navigate_sync(14, course_link_attrs[href_index].as_str().unwrap()).unwrap();*/
-		// onloadでコンテンツが読み込まれるので先に待つ
-		session.wait_event::<headless_chrome::page::LoadEventFired>().unwrap();
+		dc.sync_load(main_frame["frame"]["url"].as_str().unwrap()).unwrap();
+		dc.click_element("a#dgSystem__ctl2_lbtnSystemName").unwrap().sync().unwrap();
+		// ↑ onloadでコンテンツが読み込まれるので先に待つ
 		// 特定のフレームのロードを横取りする -> ほしいフレームだけ表示して操作
-		let mut frame_nav_begin = session.wait_event::<headless_chrome::page::FrameNavigated>().unwrap();
+		let mut frame_nav_begin = dc.session.wait_event::<headless_chrome::page::FrameNavigated>().unwrap();
 		loop
 		{
 			if frame_nav_begin.name.as_ref().map(|x| x == "MainFrame").unwrap_or(false) { break; }
-			frame_nav_begin = session.wait_event::<headless_chrome::page::FrameNavigated>().unwrap();
+			frame_nav_begin = dc.session.wait_event::<headless_chrome::page::FrameNavigated>().unwrap();
 		}
-		session.page().navigate_sync(15, &frame_nav_begin.url).unwrap();
-		session.wait_event::<headless_chrome::page::LoadEventFired>().unwrap();
-		session.runtime().evaluate(16, r#"document.querySelector('#dgSystem__ctl2_lbtnPage').click()"#).unwrap();
-		session.wait_event::<headless_chrome::page::LoadEventFired>().unwrap();
+		dc.sync_load(&frame_nav_begin.url).unwrap();
+		dc.click_element("#dgSystem__ctl2_lbtnPage").unwrap().sync().unwrap();
 
 		// ここまでで履修チェックページのデータは全部取れるはず
 
-		// 学生プロファイル
-		// セルで罫線を表現するというわけのわからない仕組みのため偶数行だけ取るようにしてる
-		// 奇数列は項目の名前("学籍番号"とか)
-		let profile_rows_data = session.runtime().evaluate_value_sync(20,
-			r#"Array.prototype.map.call(document.querySelectorAll('#TableProfile tr:nth-child(2n) td:nth-child(2n)'), function(x){ return x.textContent; })"#)
-			.unwrap();
-		let regex_replace_encoded = Regex::new(r"\\u\{([0-9a-fA-F]{4})\}").unwrap();
-		let profile_rows: Vec<_> = match profile_rows_data
-		{
-			serde_json::Value::Object(mut pro) => match pro.remove("result").unwrap()
-			{
-				serde_json::Value::Object(mut ro) => match ro.remove("value").expect("Unexpected value type returned")
-				{
-					serde_json::Value::Array(va) => va.into_iter().map(|v| match v
-					{
-						serde_json::Value::String(s) => regex_replace_encoded.replace_all(s.trim(), |cap: &Captures|
-						{
-							String::from_utf16(&[u16::from_str_radix(&cap[1], 16).unwrap()]).unwrap()
-						}).into_owned(),
-						_ => panic!("Unexpected value type returned")
-					}).collect(),
-					_ => panic!("Unexpected value type returned")
-				},
-				_ => panic!("Unexpected value type returned")
-			},
-			_ => panic!("Unexpected value type returned")
-		};
-
+		// 学生プロファイルと履修科目テーブル
+		let profile = dc.parse_profile().unwrap();
 		println!("=== 学生プロファイル ===");
-		println!("** 学籍番号: {}", profile_rows[0]);
-		println!("** 氏名: {}", profile_rows[1]);
-		println!("** 学部/学年: {} {}", profile_rows[2], profile_rows[3]);
-		println!("** セメスタ: {}", profile_rows[4]);
-		println!("** 住所: {} {} {} {}", profile_rows[5], profile_rows[6], profile_rows[7], profile_rows[8]);
+		println!("** 学籍番号: {}", profile.id);
+		println!("** 氏名: {}", profile.name);
+		println!("** 学部/学年: {} {}", profile.course, profile.grade);
+		println!("** セメスタ: {}", profile.semester);
+		println!("** 住所: {}", profile.address.join(" "));
+		println!("{}", serde_json::to_string(&dc.parse_course_table().unwrap()).unwrap());
 
-		// 履修テーブル(前半クォーター分だけ)の取得(クラス名の段階でわかるけどこれで3Q4Qどっちも取れる)
-		// †履修テーブルの仕組み†
-		// - 科目名が入るところは全部rishu-tbl-cellクラスっぽい(科目が入ってるところはbackground-colorスタイルが指定されて白くなっている)
-		// - 科目があるセルはなんと3重table構造(はじめて見た)
-		//   - 外側のtableは周囲に1pxの空きをつくるためのもの？
-		//   - 2番目のtableが実際のコンテンツレイアウト
-		//   - 3番目のtableは科目の詳細(2番目のtableにまとめられそうだけど)
-		//   - ちなみに2番目の科目名と3番目は別の行に見えて同一のtd(tr)内(なぜ)
-		//   - 空のセルにも1番目のtableだけ入ってる(自動生成の都合っぽい感じ)
-		//     - これのおかげで若干空きセルに立体感が出る（？
-
-		// 下のスクリプトで得られるデータは行優先です(0~5が1限、6~11が2限といった感じ)
-		let course_table = match session.runtime().evaluate_value_sync(21, r#"
-			var tables = document.querySelectorAll('table.rishu-tbl-cell');
-			// 前半クォーターは3、後半クォーターは5
-			var q1_koma_cells = tables[3].querySelectorAll('td.rishu-tbl-cell');
-			var q2_koma_cells = tables[5].querySelectorAll('td.rishu-tbl-cell');
-			[Array.prototype.map.call(q1_koma_cells, function(k)
-			{
-				var title_link = k.querySelector('a');
-				if(!title_link) return null; else return title_link.textContent;
-			}), Array.prototype.map.call(q2_koma_cells, function(k)
-			{
-				var title_link = k.querySelector('a');
-				if(!title_link) return null; else return title_link.textContent;
-			})]
-		"#).unwrap()
-		{
-			serde_json::Value::Object(mut ro) => match ro.remove("result")
-			{
-				Some(serde_json::Value::Object(mut vo)) => match vo.remove("value")
-				{
-					Some(serde_json::Value::Array(v)) => v.into_iter().map(|v| match v
-					{
-						serde_json::Value::Array(vi) => vi.into_iter().map(|vs| match vs
-						{
-							serde_json::Value::Null => String::new(),
-							serde_json::Value::String(s) => s,
-							_ => panic!("Unexpected value type returned")
-						}).collect(),
-						_ => panic!("Unexpected value type returned")
-					}).collect::<Vec<Vec<_>>>(),
-					_ => panic!("Unexpected value type returned")
-				},
-				_ => panic!("Unexpected value type returned")
-			},
-			_ => panic!("Unexpected value type returned")
-		};
-
-		#[derive(Serialize)] #[serde(rename_all = "camelCase")] struct CourseTable
-		{
-			first_quarter: Vec<Vec<String>>, last_quarter: Vec<Vec<String>>
-		}
-		println!("{}", serde_json::to_string(&CourseTable
-		{
-			first_quarter: course_table[0].chunks(6).map(|x| x.to_owned()).collect(),
-			last_quarter: course_table[1].chunks(6).map(|x| x.to_owned()).collect()
-		}).unwrap());
-
-		// println!("CourseTable FirstQuarter: {:?}", course_table[0]);
-		// println!("CourseTable LastQuarter: {:?}", course_table[1]);
-		
 		/*
 		// vvv Experimental環境で有効(だとおもわれる) vvv
 		// 別フレームの要素にアクセスできないらしいので新しくIsolatedなContextを作る
