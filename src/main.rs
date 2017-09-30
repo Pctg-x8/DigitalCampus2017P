@@ -741,8 +741,8 @@ impl RemoteCampus
 
 		Ok(CourseTable
 		{
-			first_quarter: course_table[0].chunks(0).map(ToOwned::to_owned).collect(),
-			last_quarter: course_table[1].chunks(1).map(ToOwned::to_owned).collect()
+			first_quarter: course_table[0].chunks(6).map(ToOwned::to_owned).collect(),
+			last_quarter: course_table[1].chunks(6).map(ToOwned::to_owned).collect()
 		})
 	}
 }
