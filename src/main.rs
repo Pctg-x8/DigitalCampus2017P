@@ -439,10 +439,13 @@ mod headless_chrome
 	{
 		pub fn run(port: u16, initial_url: &str) -> IOResult<Self>
 		{
+			#[cfg(windows)] const CHROME_DEFAULT_BIN: &'static str = r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe";
+			#[cfg(linux)]   const CHROME_DEFAULT_BIN: &'static str = "google-chrome-stable";
+
 			let chrome_bin = ::std::env::var("CHROME_BIN").unwrap_or_else(|_|
 			{
-				println!("Warning: $CHROME_BIN is not set, defaulting to \"google-chrome-stable\"");
-				"google-chrome-stable".into()
+				println!("Warning: $CHROME_BIN is not set, defaulting to \"{}\"", CHROME_DEFAULT_BIN);
+				CHROME_DEFAULT_BIN.into()
 			});
 			let mut cmd = Command::new(&chrome_bin);
 			cmd.args(&["--headless", "--disable-gpu", &format!("--remote-debugging-port={}", port), initial_url]);
@@ -713,9 +716,12 @@ fn prompt(text: &str) -> String
 	std::io::stdin().read_line(&mut s).unwrap(); s
 }
 
-extern crate termios;
-const STDIN_FD: std::os::unix::io::RawFd = 0;
 // platform dependent - POSIX(Linux)
+#[cfg(linux)]
+extern crate termios;
+#[cfg(linux)]
+const STDIN_FD: std::os::unix::io::RawFd = 0;
+#[cfg(linux)]
 fn disable_echo()
 {
 	use termios::Termios;
@@ -723,10 +729,29 @@ fn disable_echo()
 	tio.c_lflag &= !termios::ECHO;
 	termios::tcsetattr(STDIN_FD, termios::TCSANOW, &tio).unwrap();
 }
+#[cfg(linux)]
 fn enable_echo()
 {
 	use termios::Termios;
 	let mut tio = Termios::from_fd(STDIN_FD).unwrap();
 	tio.c_lflag |= termios::ECHO;
 	termios::tcsetattr(STDIN_FD, termios::TCSANOW, &tio).unwrap();
+}
+
+// platform dependent - Win32
+#[cfg(windows)] extern crate winapi;
+#[cfg(windows)] extern crate kernel32;
+#[cfg(windows)] fn disable_echo()
+{
+	let hstdin = unsafe { kernel32::GetStdHandle(winapi::STD_INPUT_HANDLE) };
+	let mut mode = 0;
+	unsafe { kernel32::GetConsoleMode(hstdin, &mut mode) };
+	unsafe { kernel32::SetConsoleMode(hstdin, mode & !winapi::ENABLE_ECHO_INPUT) };
+}
+#[cfg(windows)] fn enable_echo()
+{
+	let hstdin = unsafe { kernel32::GetStdHandle(winapi::STD_INPUT_HANDLE) };
+	let mut mode = 0;
+	unsafe { kernel32::GetConsoleMode(hstdin, &mut mode) };
+	unsafe { kernel32::SetConsoleMode(hstdin, mode | winapi::ENABLE_ECHO_INPUT) };
 }
