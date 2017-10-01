@@ -1,4 +1,6 @@
 
+#![feature(iterator_step_by)]
+
 extern crate tokio_core;
 extern crate hyper;
 extern crate futures;
@@ -15,12 +17,39 @@ use futures::{Future, Stream};
 use std::io::prelude::*;
 use std::error::Error;
 
-type GenericResult<T> = Result<T, Box<Error>>;
-
 macro_rules! api_corruption
 {
 	(value_type) => (panic!("Unexpected value type returned. the API may be corrupted"))
 }
+macro_rules! jvDecomposite
+{
+	{ $v: expr => object[$inner: pat]: $e: expr } =>
+	{
+		match $v { JValue::Object($inner) => $e, _ => api_corruption!(value_type) }
+	};
+	{ $v: expr => array[$inner: pat]: $e: expr } =>
+	{
+		match $v { JValue::Array($inner) => $e, _ => api_corruption!(value_type) }
+	};
+	{ $v: expr => string[$inner: pat]: $e: expr } =>
+	{
+		match $v { JValue::String($inner) => $e, _ => api_corruption!(value_type) }
+	};
+	{ $v: expr => opt object[$inner: pat]: $e: expr } =>
+	{
+		match $v { Some(JValue::Object($inner)) => $e, _ => api_corruption!(value_type) }
+	};
+	{ $v: expr => opt array[$inner: pat]: $e: expr } =>
+	{
+		match $v { Some(JValue::Array($inner)) => $e, _ => api_corruption!(value_type) }
+	};
+	{ $v: expr => opt string[$inner: pat]: $e: expr } =>
+	{
+		match $v { Some(JValue::String($inner)) => $e, _ => api_corruption!(value_type) }
+	};
+}
+
+type GenericResult<T> = Result<T, Box<Error>>;
 
 mod headless_chrome;
 mod remote_campus;
@@ -47,6 +76,8 @@ fn main()
 {
 	println!("DigitalCampus 2017 Prototype");
 
+	let autologin = std::env::args().nth(1).map(|s| s.split(":").map(ToOwned::to_owned).collect::<Vec<String>>());
+
 	let chrome = headless_chrome::Process::run(9222, "https://dh.force.com/digitalCampus/campusHomepage").expect("Failed to launch the Headless Chrome");
 
 	let mut tcore = Core::new().expect("Failed to initialize tokio-core");
@@ -66,33 +97,47 @@ fn main()
 	};
 
 	println!("Connecting {}...", session_list[0]);
+	let dc = RemoteCampus::connect(&session_list[0]).expect("Failed to connect to a session in the Headless Chrome");
+	println!("  Connection established.");
+	let pctrl = dc.wait_login_completion().expect("Failed waiting initial login completion").unwrap_or_else(move |mut e|
 	{
-		let dc = RemoteCampus::connect(&session_list[0]).expect("Failed to connect to a session in the Headless Chrome");
-		println!("  Connection established.");
-		let pctrl = dc.wait_login_completion().expect("Failed waiting initial login completion").unwrap_or_else(|e|
+		// println!("Logging-in required for DigitalCampus");
+		println!("デジキャンへのログインが必要です。");
+		if let Some(al) = autologin
 		{
-			// println!("Logging-in required for DigitalCampus");
-			println!("デジキャンへのログインが必要です。");
-			process_login(e)
-		});
-		println!("履修ページへアクセスしています...");
-		let intersysmenu = pctrl.jump_into_intersys().unwrap().isolate_mainframe().unwrap();
-		let coursemenu = intersysmenu.jump_into_course_category().unwrap().isolate_mainframe_stealing_load().unwrap();
-		let mut cdetails = coursemenu.jump_into_course_details().unwrap();
+			println!("自動ログインの処理中です({})...", al[0]);
+			e.set_login_info_fields(&al[0], &al[1]).unwrap();
+			e.submit().expect("Error logging in").unwrap_or_else(|e|
+			{
+				// println!("** Failed to login to DigitalCampus. Check whether Student Number or password is correct **");
+				println!("** デジキャンへのログインに失敗しました。学籍番号またはパスワードが正しいか確認してください。 **");
+				process_login(e)
+			})
+		}
+		else { process_login(e) }
+	});
+	println!("履修ページへアクセスしています...");
+	let mut intersysmenu = pctrl.jump_into_intersys().unwrap().isolate_mainframe().unwrap();
 
-		// ここまでで履修チェックページのデータは全部取れるはず
+	// 学生プロファイルと履修科目テーブル
+	/*let mut cdetails = intersysmenu.interrupt().unwrap().jump_into_course_category().unwrap().isolate_mainframe_stealing_load().unwrap()
+		.jump_into_course_details().unwrap();
+	let profile = cdetails.parse_profile().unwrap();
+	/*println!("=== 学生プロファイル ===");
+	println!("** 学籍番号: {}", profile.id);
+	println!("** 氏名: {}", profile.name);
+	println!("** 学部/学年: {} {}", profile.course, profile.grade);
+	println!("** セメスタ: {}", profile.semester);
+	println!("** 住所: {}", profile.address.join(" "))*/
+	println!("{}", serde_json::to_string(&profile).unwrap());
+	println!("{}", serde_json::to_string(&cdetails.parse_course_table().unwrap()).unwrap());
+	println!("{}", serde_json::to_string(&cdetails.parse_graduation_requirements_table().unwrap()).unwrap());*/
 
-		// 学生プロファイルと履修科目テーブル
-		let profile = cdetails.parse_profile().unwrap();
-		/*println!("=== 学生プロファイル ===");
-		println!("** 学籍番号: {}", profile.id);
-		println!("** 氏名: {}", profile.name);
-		println!("** 学部/学年: {} {}", profile.course, profile.grade);
-		println!("** セメスタ: {}", profile.semester);
-		println!("** 住所: {}", profile.address.join(" "))*/
-		println!("{}", serde_json::to_string(&profile).unwrap());
-		println!("{}", serde_json::to_string(&cdetails.parse_course_table().unwrap()).unwrap());
-	}
+	// 出席率を取りたい
+	let mut adetails = intersysmenu./*activate(cdetails.leave()).unwrap().*/jump_into_attendance_category().unwrap().isolate_mainframe_stealing_load().unwrap()
+		.jump_into_details().unwrap();
+	println!("{}", serde_json::to_string(&adetails.parse_current_year_table().unwrap()).unwrap());
+	println!("{}", serde_json::to_string(&adetails.parse_attendance_rates().unwrap()).unwrap());
 }
 
 fn prompt(text: &str) -> String
