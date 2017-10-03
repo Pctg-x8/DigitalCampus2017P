@@ -4,12 +4,11 @@ use {headless_chrome, GenericResult};
 use headless_chrome::{SessionEventSubscriber, SessionEventSubscribable};
 use std::sync::atomic::{Ordering, AtomicUsize};
 use std::net::TcpStream;
-use serde_json; use serde_json::Value as JValue;
-use serde_json::Map as JMap;
+use serde_json;
+use serde_json::{Value as JValue, Map as JMap};
 use regex::{Regex, Captures};
 use std::marker::PhantomData;
-use std::mem::transmute_copy;
-use std::mem::replace;
+use std::mem::{replace, transmute_copy, transmute};
 use std::str::FromStr;
 
 pub trait QueryValueType<T: Sized>: Sized { fn unwrap(self) -> T; }
@@ -40,28 +39,57 @@ impl RemoteCampus
 	pub fn connect(addr: &str) -> GenericResult<Self>
 	{
 		let mut object = headless_chrome::Session::connect(addr).map(|session| RemoteCampus { session, request_id: AtomicUsize::new(1) })?;
-		let objptr = &object as &SessionEventSubscriber<_> as *const _ as *mut _;
-		unsafe { object.session.subscribe_session_event_raw(objptr) };
+		unsafe
+		{
+			let objptr: *mut RemoteCampus = &object as *const _ as *mut _;
+			(&mut object.session as &mut SessionEventSubscribable<headless_chrome::page::FrameNavigated>).subscribe_session_event_raw(objptr);
+			(&mut object.session as &mut SessionEventSubscribable<headless_chrome::runtime::ExecutionContextCreated>).subscribe_session_event_raw(objptr);
+			(&mut object.session as &mut SessionEventSubscribable<headless_chrome::runtime::ExecutionContextDestroyed>).subscribe_session_event_raw(objptr);
+			(&mut object.session as &mut SessionEventSubscribable<headless_chrome::runtime::ExecutionContextsCleared>).subscribe_session_event_raw(objptr);
+		}
 		object.session.page().enable(0).unwrap(); object.session.wait_result(0).unwrap();
 		object.session.dom().enable(0).unwrap(); object.session.wait_result(0).unwrap();
+		object.session.runtime().enable(0).unwrap(); object.session.wait_result(0).unwrap();
 		Ok(object)
 	}
 	fn new_request_id(&self) -> usize { self.request_id.fetch_add(1, Ordering::SeqCst) }
 
-	pub fn query(&mut self, expression: &str) -> GenericResult<()>
+	pub fn query(&mut self, context: Option<u64>, expression: &str) -> GenericResult<()>
 	{
 		let id = self.new_request_id();
-		self.session.runtime().evaluate_sync(id, expression).map(drop)
+		let mut q: JMap<_, _> = if let Some(cid) = context
+		{
+			self.session.runtime().evaluate_in_sync(id, cid, expression).map(QueryValueType::unwrap)?
+		}
+		else
+		{
+			self.session.runtime().evaluate_sync(id, expression).map(QueryValueType::unwrap)?
+		};
+		let mut qres: JMap<_, _> = q.remove("result").unwrap().unwrap();
+		if qres.get("subtype").and_then(JValue::as_str) == Some("error")
+		{
+			// Error occured
+			Err(format!("{:?}", qres).into())
+		}
+		else { Ok(()) }
 	}
-	pub fn query_value(&mut self, expression: &str) -> GenericResult<QueryResult>
+	pub fn query_value(&mut self, context: Option<u64>, expression: &str) -> GenericResult<QueryResult>
 	{
 		let id = self.new_request_id();
-		self.session.runtime().evaluate_value_sync(id, expression).map(QueryValueType::<JMap<_, _>>::unwrap)
-			.map(|mut r| QueryResult(r.remove("result").unwrap().unwrap()))
+		if let Some(cid) = context
+		{
+			self.session.runtime().evaluate_value_in_sync(id, cid, expression).map(QueryValueType::<JMap<_, _>>::unwrap)
+				.map(|mut r| QueryResult(r.remove("result").unwrap().unwrap()))
+		}
+		else
+		{
+			self.session.runtime().evaluate_value_sync(id, expression).map(QueryValueType::<JMap<_, _>>::unwrap)
+				.map(|mut r| QueryResult(r.remove("result").unwrap().unwrap()))
+		}
 	}
 	pub fn query_page_location(&mut self) -> GenericResult<String>
 	{
-		self.query_value("location.href").map(|mut v| v.strip_value())
+		self.query_value(None, "location.href").map(|mut v| v.strip_value())
 	}
 	pub fn is_in_login_page(&mut self) -> GenericResult<bool>
 	{
@@ -72,9 +100,9 @@ impl RemoteCampus
 		self.query_page_location().map(|l| l.contains("/campusHomepage"))
 	}
 
-	pub fn click_element(&mut self, selector: &str) -> GenericResult<&mut Self>
+	pub fn click_element(&mut self, context: Option<u64>, selector: &str) -> GenericResult<&mut Self>
 	{
-		self.query(&format!(r#"document.querySelector({:?}).click()"#, selector)).map(move |_| self)
+		self.query(context, &format!(r#"document.querySelector({:?}).click()"#, selector)).map(move |_| self)
 	}
 	pub fn jump_to_anchor_href(&mut self, selector: &str) -> GenericResult<&mut Self>
 	{
@@ -99,7 +127,38 @@ impl SessionEventSubscriber<headless_chrome::page::FrameNavigated> for RemoteCam
 {
 	fn on_event(&mut self, event: &headless_chrome::page::FrameNavigated)
 	{
-		println!("FrameNavigated: {}", event.url);
+		if let Some(n) = event.name.as_ref()
+		{
+			println!("FrameNavigated: {} in {}", event.url, n);
+		}
+		else
+		{
+			println!("FrameNavigated: {}", event.url);
+		}
+	}
+}
+impl SessionEventSubscriber<headless_chrome::runtime::ExecutionContextCreated> for RemoteCampus
+{
+	fn on_event(&mut self, event: &headless_chrome::runtime::ExecutionContextCreated)
+	{
+		if let Some(fid) = event.aux.get("frameId").and_then(JValue::as_str)
+		{
+			println!("ExecutionContext Created for frame {}: {}", fid, event.context_id);
+		}
+	}
+}
+impl SessionEventSubscriber<headless_chrome::runtime::ExecutionContextDestroyed> for RemoteCampus
+{
+	fn on_event(&mut self, event: &headless_chrome::runtime::ExecutionContextDestroyed)
+	{
+		println!("ExecutionContext Destroyed: {}", event.context_id);
+	}
+}
+impl SessionEventSubscriber<headless_chrome::runtime::ExecutionContextsCleared> for RemoteCampus
+{
+	fn on_event(&mut self, _: &headless_chrome::runtime::ExecutionContextsCleared)
+	{
+		println!("ExecutionContexts were cleared by remote browser");
 	}
 }
 
@@ -160,27 +219,124 @@ impl HomePage
 	const INTERSYS_LINK_PATH: &'static str = "#gnav ul li.menuBlock ul li:first-child a";
 	/// "履修・成績・出席"リンクを処理
 	/// 将来的にmenuBlockクラスが複数出てきたらまた考えます
-	pub fn jump_into_intersys(mut self) -> GenericResult<CampusPlanEntryFrames>
+	pub fn jump_into_intersys(mut self) -> GenericResult<Box<CampusPlanEntryFrames>>
 	{
-		self.remote.jump_to_anchor_href(Self::INTERSYS_LINK_PATH)?.sync()?;
-		Ok(unsafe { self.remote.assume_cp_frame() })
+		self.remote.jump_to_anchor_href(Self::INTERSYS_LINK_PATH)?;
+		let mut r = CampusPlanFrames::enter(self.remote);
+		r.remote.sync()?;
+		Ok(r)
 	}
 }
 
+#[derive(Debug)]
+pub enum ScriptContextHolder { Unloaded, Empty(String), Context(String, u64) }
+
 /// CampusPlan フレームページ
-pub struct CampusPlanFrames<MainFrameCtrlTy: PageControl> { remote: RemoteCampus, ph: PhantomData<MainFrameCtrlTy> }
-impl RemoteCampus
+pub struct CampusPlanFrames<MainFrameCtrlTy: PageControl + 'static>
 {
-	pub unsafe fn assume_cp_frame<MainFrameCtrlTy: PageControl>(self) -> CampusPlanFrames<MainFrameCtrlTy>
+	remote: RemoteCampus, ph: PhantomData<MainFrameCtrlTy>,
+	ctx_main_frame: ScriptContextHolder
+}
+impl<MainFrameCtrlTy: PageControl + 'static> CampusPlanFrames<MainFrameCtrlTy>
+{
+	fn enter(remote: RemoteCampus) -> Box<Self>
 	{
-		CampusPlanFrames { remote: self, ph: PhantomData }
+		let mut p = box CampusPlanFrames { remote, ph: PhantomData, ctx_main_frame: ScriptContextHolder::Unloaded };
+		unsafe
+		{
+			let objptr: *mut CampusPlanFrames<MainFrameCtrlTy> = &*p as *const _ as *mut _;
+			(&mut p.remote.session as &mut SessionEventSubscribable<headless_chrome::page::FrameNavigated>).subscribe_session_event_raw(objptr);
+			(&mut p.remote.session as &mut SessionEventSubscribable<headless_chrome::runtime::ExecutionContextCreated>).subscribe_session_event_raw(objptr);
+			(&mut p.remote.session as &mut SessionEventSubscribable<headless_chrome::runtime::ExecutionContextDestroyed>).subscribe_session_event_raw(objptr);
+			(&mut p.remote.session as &mut SessionEventSubscribable<headless_chrome::runtime::ExecutionContextsCleared>).subscribe_session_event_raw(objptr);
+		} p
+	}
+	fn leave(&mut self)
+	{
+		unsafe
+		{
+			let objptr: *mut CampusPlanFrames<MainFrameCtrlTy> = self as *mut _;
+			(&mut self.remote.session as &mut SessionEventSubscribable<headless_chrome::page::FrameNavigated>).unsubscribe_session_event_raw(objptr);
+			(&mut self.remote.session as &mut SessionEventSubscribable<headless_chrome::runtime::ExecutionContextCreated>).unsubscribe_session_event_raw(objptr);
+			(&mut self.remote.session as &mut SessionEventSubscribable<headless_chrome::runtime::ExecutionContextDestroyed>).unsubscribe_session_event_raw(objptr);
+			(&mut self.remote.session as &mut SessionEventSubscribable<headless_chrome::runtime::ExecutionContextsCleared>).unsubscribe_session_event_raw(objptr);
+		}
+	}
+	fn continue_enter<NewMainFrameCtrlTy: PageControl>(self) -> CampusPlanFrames<NewMainFrameCtrlTy>
+	{
+		unsafe { transmute(self) }
+	}
+	fn main_frame_context(&self) -> u64
+	{
+		if let ScriptContextHolder::Context(_, s) = self.ctx_main_frame { s }
+		else { panic!("ExecutionContext for MainFrame has not been created yet"); }
+	}
+	fn wait_main_frame_context(&self) -> u64
+	{
+		if let ScriptContextHolder::Context(_, s) = self.ctx_main_frame { s }
+		else { self.wait_main_frame_context() }
+	}
+}
+impl<MainFrameCtrlTy: PageControl> SessionEventSubscriber<headless_chrome::page::FrameNavigated>
+	for CampusPlanFrames<MainFrameCtrlTy>
+{
+	fn on_event(&mut self, event: &headless_chrome::page::FrameNavigated)
+	{
+		if event.name.as_ref().map(|x| x as &str) == Some("MainFrame")
+		{
+			self.ctx_main_frame = ScriptContextHolder::Empty(event.frame_id.clone());
+		}
+	}
+}
+impl<MainFrameCtrlTy: PageControl> SessionEventSubscriber<headless_chrome::runtime::ExecutionContextCreated>
+	for CampusPlanFrames<MainFrameCtrlTy>
+{
+	fn on_event(&mut self, event: &headless_chrome::runtime::ExecutionContextCreated)
+	{
+		let c = match (event.aux.get("frameId").and_then(JValue::as_str), replace(&mut self.ctx_main_frame, ScriptContextHolder::Unloaded))
+		{
+			(Some(fid), ScriptContextHolder::Empty(s)) =>
+				if fid == s { ScriptContextHolder::Context(s, event.context_id) }
+				else { ScriptContextHolder::Empty(s) },
+			(Some(fid), ScriptContextHolder::Context(s, c)) =>
+				if fid == s { ScriptContextHolder::Context(s, event.context_id) }
+				else { ScriptContextHolder::Context(s, c) },
+			(_, c) => { c }
+		};
+		self.ctx_main_frame = c;
+	}
+}
+impl<MainFrameCtrlTy: PageControl> SessionEventSubscriber<headless_chrome::runtime::ExecutionContextDestroyed>
+	for CampusPlanFrames<MainFrameCtrlTy>
+{
+	fn on_event(&mut self, event: &headless_chrome::runtime::ExecutionContextDestroyed)
+	{
+		self.ctx_main_frame = match replace(&mut self.ctx_main_frame, ScriptContextHolder::Unloaded)
+		{
+			ScriptContextHolder::Context(fid, cid) =>
+				if event.context_id == cid { ScriptContextHolder::Empty(fid) }
+				else { ScriptContextHolder::Context(fid, cid) },
+			c => c
+		};
+	}
+}
+impl<MainFrameCtrlTy: PageControl> SessionEventSubscriber<headless_chrome::runtime::ExecutionContextsCleared>
+	for CampusPlanFrames<MainFrameCtrlTy>
+{
+	fn on_event(&mut self, _: &headless_chrome::runtime::ExecutionContextsCleared)
+	{
+		self.ctx_main_frame = match replace(&mut self.ctx_main_frame, ScriptContextHolder::Unloaded)
+		{
+			ScriptContextHolder::Context(fid, _) => ScriptContextHolder::Empty(fid),
+			c => c
+		};
 	}
 }
 pub type CampusPlanEntryFrames      = CampusPlanFrames<CampusPlanEntryPage>;
 pub type CampusPlanCourseFrames     = CampusPlanFrames<CampusPlanCoursePage>;
 pub type CampusPlanSyllabusFrames   = CampusPlanFrames<CampusPlanSyllabusPage>;
 pub type CampusPlanAttendanceFrames = CampusPlanFrames<CampusPlanAttendancePage>;
-impl<MainFrameCtrlTy: PageControl> CampusPlanFrames<MainFrameCtrlTy>
+/*impl<MainFrameCtrlTy: PageControl + 'static> CampusPlanFrames<MainFrameCtrlTy>
 {
 	/// ほしいフレームの中身のみ表示してメインコンテキストにする
 	pub fn isolate_frame(mut self, name: &str) -> GenericResult<RemoteCampus>
@@ -211,43 +367,12 @@ impl<MainFrameCtrlTy: PageControl> CampusPlanFrames<MainFrameCtrlTy>
 	{
 		self.isolate_frame_stealing_load("MainFrame").map(|x| unsafe { MainFrameCtrlTy::with_remote(x) })
 	}
-}
-pub enum CampusPlanEntryPage { Active(RemoteCampus), Interrupted(String), Unreferred }
-/// ページ遷移に関わる
-impl CampusPlanEntryPage
-{
-	/// あとで戻ってこれるようにする
-	pub fn interrupt(&mut self) -> GenericResult<Self>
-	{
-		let active = match self { &mut CampusPlanEntryPage::Active(_) => true, _ => false };
-		if active
-		{
-			let mut remote = match replace(self, CampusPlanEntryPage::Unreferred)
-			{
-				CampusPlanEntryPage::Active(remote) => remote, _ => unreachable!()
-			};
-			*self = remote.query_page_location().map(CampusPlanEntryPage::Interrupted)?;
-			Ok(CampusPlanEntryPage::Active(remote))
-		}
-		else { panic!("Interrupting interrupted page"); }
-	}
-	/// もどってくる
-	pub fn activate(self, mut remote: RemoteCampus) -> GenericResult<Self>
-	{
-		if let CampusPlanEntryPage::Interrupted(url) = self
-		{
-			remote.sync_load(&url)?; Ok(unsafe { Self::with_remote(remote) })
-		}
-		else { Ok(self) }
-	}
-	fn access_remote(self) -> RemoteCampus
-	{
-		if let CampusPlanEntryPage::Active(remote) = self { remote }
-		else { panic!("Accessing to the CampusPlanEntryPage in Interrupted state"); }
-	}
-}
+}*/
+
+/// Tag(CampusPlanのエントリーページを表す)
+pub enum CampusPlanEntryPage {}
 /// コンテンツ操作に関わる
-impl CampusPlanEntryPage
+impl CampusPlanFrames<CampusPlanEntryPage>
 {
 	const COURSE_CATEGORY_LINK_ID:     &'static str = "#dgSystem__ctl2_lbtnSystemName";
 	#[allow(dead_code)]
@@ -255,68 +380,79 @@ impl CampusPlanEntryPage
 	const ATTENDANCE_CATEGORY_LINK_ID: &'static str = "#dgSystem__ctl4_lbtnSystemName";
 
 	/// 履修関係セクションへ
-	pub fn jump_into_course_category(self) -> GenericResult<CampusPlanCourseFrames>
+	pub fn jump_into_course_category(mut self) -> GenericResult<Box<CampusPlanCourseFrames>>
 	{
-		let mut remote = self.access_remote();
-		remote.click_element(Self::COURSE_CATEGORY_LINK_ID)?.sync()?; Ok(unsafe { remote.assume_cp_frame() })
+		let rctx = Some(self.main_frame_context());
+		self.remote.click_element(rctx, Self::COURSE_CATEGORY_LINK_ID)?;
+		self.leave(); let mut r = CampusPlanFrames::enter(self.remote);
+		r.remote.sync()?; r.wait_main_frame_context(); Ok(r)
 	}
 	/// Webシラバスセクションへ
 	#[allow(dead_code)]
-	pub fn jump_into_syllabus_category(self) -> GenericResult<CampusPlanSyllabusFrames>
+	pub fn jump_into_syllabus_category(mut self) -> GenericResult<Box<CampusPlanSyllabusFrames>>
 	{
-		let mut remote = self.access_remote();
-		remote.click_element(Self::SYLLABUS_CATEGORY_LINK_ID)?.sync()?; Ok(unsafe { remote.assume_cp_frame() })
+		let rctx = Some(self.main_frame_context());
+		self.remote.click_element(rctx, Self::SYLLABUS_CATEGORY_LINK_ID)?;
+		self.leave(); let mut r = CampusPlanFrames::enter(self.remote);
+		r.remote.sync()?; r.wait_main_frame_context(); Ok(r)
 	}
 	/// 出欠関係セクションへ
-	pub fn jump_into_attendance_category(self) -> GenericResult<CampusPlanAttendanceFrames>
+	pub fn jump_into_attendance_category(mut self) -> GenericResult<Box<CampusPlanAttendanceFrames>>
 	{
-		let mut remote = self.access_remote();
-		remote.click_element(Self::ATTENDANCE_CATEGORY_LINK_ID)?.sync()?; Ok(unsafe { remote.assume_cp_frame() })
+		let rctx = Some(self.main_frame_context());
+		self.remote.click_element(rctx, Self::ATTENDANCE_CATEGORY_LINK_ID)?;
+		self.leave(); let mut r = CampusPlanFrames::enter(self.remote);
+		r.remote.sync()?; r.wait_main_frame_context(); Ok(r)
 	}
 }
-pub struct CampusPlanCoursePage { remote: RemoteCampus }
-impl CampusPlanCoursePage
+/// Tag(CampusPlanの履修関係メニューページを表す)
+pub enum CampusPlanCoursePage { }
+impl CampusPlanFrames<CampusPlanCoursePage>
 {
 	/// 履修チェック結果の確認ページへ
 	/// * 履修登録期間中はこれだと動かないかもしれない
-	pub fn jump_into_course_details(mut self) -> GenericResult<CourseDetailsPage>
+	pub fn jump_into_course_details(mut self) -> GenericResult<CampusPlanFrames<CourseDetailsPage>>
 	{
-		self.remote.click_element("#dgSystem__ctl2_lbtnPage")?.sync()?;
-		Ok(unsafe { self.remote.assume_course_details() })
+		let rctx = Some(self.main_frame_context());
+		self.remote.click_element(rctx, "#dgSystem__ctl2_lbtnPage")?.sync()?;
+		Ok(self.continue_enter())
 	}
 }
 /// 未実装
 #[allow(dead_code)]
-pub struct CampusPlanSyllabusPage { remote: RemoteCampus }
-pub struct CampusPlanAttendancePage { remote: RemoteCampus }
-impl CampusPlanAttendancePage
+pub enum CampusPlanSyllabusPage { }
+pub enum CampusPlanAttendancePage { }
+impl CampusPlanFrames<CampusPlanAttendancePage>
 {
 	const ATTENDANCE_REF_LINK_ID: &'static str = "#dgSystem__ctl2_lbtnPage";
 	/// 出欠状況参照ページへ
-	pub fn jump_into_details(mut self) -> GenericResult<AttendanceDetailsPage>
+	pub fn jump_into_details(mut self) -> GenericResult<CampusPlanFrames<AttendanceDetailsPage>>
 	{
-		self.remote.click_element(Self::ATTENDANCE_REF_LINK_ID)?.sync()?;
-		Ok(unsafe { self.remote.assume_attendance_details() })
+		let rctx = Some(self.main_frame_context());
+		self.remote.click_element(rctx, Self::ATTENDANCE_REF_LINK_ID)?.sync()?;
+		Ok(self.continue_enter())
 	}
 }
-pub trait PageControl: Sized { unsafe fn with_remote(r: RemoteCampus) -> Self; }
-impl PageControl for CampusPlanEntryPage  { unsafe fn with_remote(r: RemoteCampus) -> Self { CampusPlanEntryPage::Active(r) } }
-impl PageControl for CampusPlanCoursePage { unsafe fn with_remote(r: RemoteCampus) -> Self { CampusPlanCoursePage { remote: r } } }
-impl PageControl for CampusPlanSyllabusPage { unsafe fn with_remote(r: RemoteCampus) -> Self { CampusPlanSyllabusPage { remote: r } } }
-impl PageControl for CampusPlanAttendancePage { unsafe fn with_remote(r: RemoteCampus) -> Self { CampusPlanAttendancePage { remote: r } } }
+pub trait PageControl: Sized { }
+impl PageControl for CampusPlanEntryPage  { }
+impl PageControl for CampusPlanCoursePage { }
+impl PageControl for CampusPlanSyllabusPage { }
+impl PageControl for CampusPlanAttendancePage { }
+impl PageControl for CourseDetailsPage { }
+impl PageControl for AttendanceDetailsPage { }
 
 /// 履修確認ページ
-pub struct CourseDetailsPage { remote: RemoteCampus }
-impl RemoteCampus { pub unsafe fn assume_course_details(self) -> CourseDetailsPage { CourseDetailsPage { remote: self } } }
+pub enum CourseDetailsPage { }
 /// 学生プロファイル/履修データの解析周り
-impl CourseDetailsPage
+impl CampusPlanFrames<CourseDetailsPage>
 {
 	/// 学生プロファイルテーブルの解析　　
 	/// セルで罫線を表現するというわけのわからない仕組みのため偶数行だけ取るようにしてる　　
 	/// 奇数列は項目の名前("学籍番号"とか)
 	pub fn parse_profile(&mut self) -> GenericResult<StudentProfile>
 	{
-		let profile_rows_data = self.remote.query_value(
+		let rctx = Some(self.main_frame_context());
+		let profile_rows_data = self.remote.query_value(rctx, 
 			r#"Array.prototype.map.call(document.querySelectorAll('#TableProfile tr:nth-child(2n) td:nth-child(2n)'), x => x.textContent)"#)?;
 		let regex_replace_encoded = Regex::new(r"\\u\{([0-9a-fA-F]{4})\}").unwrap();
 		let mut profile_rows: Vec<_> = profile_rows_data.value().as_array().unwrap().iter()
@@ -344,7 +480,8 @@ impl CourseDetailsPage
 	pub fn parse_course_table(&mut self) -> GenericResult<CourseTable>
 	{
 		// 下のスクリプトで得られるデータは行優先です(0~5が1限、6~11が2限といった感じ)
-		let values: Vec<_> = self.remote.query_value(r#"
+		let rctx = Some(self.main_frame_context());
+		let values: Vec<_> = self.remote.query_value(rctx, r#"
 			var tables = document.querySelectorAll('table.rishu-tbl-cell');
 			// 前半クォーターは3、後半クォーターは5
 			var q1_koma_cells = tables[3].querySelectorAll('td.rishu-tbl-cell');
@@ -375,7 +512,8 @@ impl CourseDetailsPage
 	/// 卒業要件集計欄のデータを取得
 	pub fn parse_graduation_requirements_table(&mut self) -> GenericResult<GraduationRequirements>
 	{
-		let content_values: Vec<_> = self.remote.query_value(r#"
+		let rctx = Some(self.main_frame_context());
+		let content_values: Vec<_> = self.remote.query_value(rctx, r#"
 			var table = document.getElementById('dgrdSotsugyoYoken');
 			var rows = table.querySelectorAll('tr.text-main td:not(:first-child)');
 			Array.prototype.map.call(rows, x => x.textContent)
@@ -389,11 +527,6 @@ impl CourseDetailsPage
 			current: From::from(content.by_ref().take(9).collect::<Result<Vec<u16>, _>>()?)
 		})
 	}
-}
-impl CourseDetailsPage
-{
-	/// ページを離れる(制御をRemoteCampusに返す)
-	pub fn leave(self) -> RemoteCampus { self.remote }
 }
 /// 学生プロファイル
 #[derive(Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
@@ -447,9 +580,8 @@ impl From<Vec<u16>> for CategorizedUnits
 }
 
 /// 出欠状況参照ページ
-pub struct AttendanceDetailsPage { remote: RemoteCampus }
-impl RemoteCampus { pub unsafe fn assume_attendance_details(self) -> AttendanceDetailsPage { AttendanceDetailsPage { remote: self } } }
-impl AttendanceDetailsPage
+pub enum AttendanceDetailsPage { }
+impl CampusPlanFrames<AttendanceDetailsPage>
 {
 	const TABLE_ID: &'static str = "dg";
 	const BY_PERIOD_TABLE_ID: &'static str = "dgKikanbetsu";
@@ -457,7 +589,8 @@ impl AttendanceDetailsPage
 	/// 今年度の出欠状況テーブルを取得
 	pub fn parse_current_year_table(&mut self) -> GenericResult<Vec<SubjectAttendanceState>>
 	{
-		let mut res_values: Vec<_> = self.remote.query_value(&format!(r#"
+		let rctx = Some(self.main_frame_context());
+		let mut res_values: Vec<_> = self.remote.query_value(rctx, &format!(r#"
 			var table = document.getElementById({:?});
 			var rows = table.querySelectorAll("tr:not(:first-child) td");
 			Array.prototype.map.call(rows, x => x.textContent)
@@ -506,7 +639,8 @@ impl AttendanceDetailsPage
 	/// 期間別出席率テーブルの取得
 	pub fn parse_attendance_rates(&mut self) -> GenericResult<PeriodAttendanceRates>
 	{
-		let res_values: Vec<_> = self.remote.query_value(&format!(r#"
+		let rctx = Some(self.main_frame_context());
+		let res_values: Vec<_> = self.remote.query_value(rctx, &format!(r#"
 			var table = document.getElementById({:?});
 			var rows = table.querySelectorAll("tr:not(:first-child) td");
 			Array.prototype.map.call(rows, x => x.textContent)

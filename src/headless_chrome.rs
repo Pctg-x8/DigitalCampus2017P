@@ -1,5 +1,7 @@
 //! An interface to the Headless Chrome
 
+#![allow(dead_code)]
+
 use serde::Serialize;
 use hyper::client::{Client, Connect, FutureResponse};
 use websocket::WebSocketResult;
@@ -11,7 +13,7 @@ use std::process::{Child, Command};
 use std::io::prelude::{Write, Read};
 use std::net::TcpStream;
 use std::io::{Result as IOResult, ErrorKind as IOErrorKind};
-use serde_json::Value as JValue; use serde_json;
+use serde_json::{Value as JValue, Map as JMap}; use serde_json;
 use GenericResult;
 
 /// `json/version` response
@@ -60,11 +62,19 @@ pub trait SessionEventSubscribable<E: Event>
 		unsafe { self.unsubscribe_session_event_raw(subscriber as *const _ as *mut _) }
 	}
 }
+pub trait Event: Sized
+{
+	const METHOD_NAME: &'static str;
+	fn deserialize(res: JMap<String, JValue>) -> Self;
+}
 
 pub struct Session<W: Write, R: Read>
 {
 	sender: WebSocketWriter<W>, receiver: WebSocketReader<R>,
-	frame_navigated_event_subscriber: Vec<*mut SessionEventSubscriber<page::FrameNavigated>>
+	frame_navigated_event_subscriber: Vec<*mut SessionEventSubscriber<page::FrameNavigated>>,
+	runtime_context_create_event_subscriber: Vec<*mut SessionEventSubscriber<runtime::ExecutionContextCreated>>,
+	runtime_context_destroy_event_subscriber: Vec<*mut SessionEventSubscriber<runtime::ExecutionContextDestroyed>>,
+	runtime_contexts_cleared_event_subscriber: Vec<*mut SessionEventSubscriber<runtime::ExecutionContextsCleared>>
 }
 impl Session<TcpStream, TcpStream>
 {
@@ -72,7 +82,12 @@ impl Session<TcpStream, TcpStream>
 	{
 		let ws_client = ClientBuilder::new(addr)?.connect_insecure()?;
 		let (recv, send) = ws_client.split()?;
-		Ok(Session { sender: send, receiver: recv, frame_navigated_event_subscriber: Vec::new() })
+		Ok(Session
+		{
+			sender: send, receiver: recv,
+			frame_navigated_event_subscriber: Vec::new(), runtime_context_create_event_subscriber: Vec::new(),
+			runtime_context_destroy_event_subscriber: Vec::new(), runtime_contexts_cleared_event_subscriber: Vec::new()
+		})
 	}
 }
 impl<W: Write, R: Read> Session<W, R>
@@ -82,18 +97,27 @@ impl<W: Write, R: Read> Session<W, R>
 	pub fn page(&mut self) -> domain::Page<W, R> { domain::Page(self) }
 	pub fn runtime(&mut self) -> domain::Runtime<W, R> { domain::Runtime(self) }
 }
-impl<W: Write, R: Read> SessionEventSubscribable<page::FrameNavigated> for Session<W, R>
+macro_rules! SessionEventSubscribable
 {
-	unsafe fn subscribe_session_event_raw(&mut self, subscriber: *mut SessionEventSubscriber<page::FrameNavigated>)
+	($t: ty => $v: ident) =>
 	{
-		self.frame_navigated_event_subscriber.push(subscriber);
-	}
-	unsafe fn unsubscribe_session_event_raw(&mut self, subscriber: *mut SessionEventSubscriber<page::FrameNavigated>)
-	{
-		let index = self.frame_navigated_event_subscriber.iter().position(|&x| x == subscriber).expect("Already unsubscribed?");
-		self.frame_navigated_event_subscriber.remove(index);
+		impl<W: Write, R: Read> SessionEventSubscribable<$t> for Session<W, R>
+		{
+			unsafe fn subscribe_session_event_raw(&mut self, subscriber: *mut SessionEventSubscriber<$t>)
+			{
+				self.$v.push(subscriber);
+			}
+			unsafe fn unsubscribe_session_event_raw(&mut self, subscriber: *mut SessionEventSubscriber<$t>)
+			{
+				if let Some(index) = self.$v.iter().position(|&x| x == subscriber) { self.$v.remove(index); }
+			}
+		}
 	}
 }
+SessionEventSubscribable!(page::FrameNavigated => frame_navigated_event_subscriber);
+SessionEventSubscribable!(runtime::ExecutionContextCreated => runtime_context_create_event_subscriber);
+SessionEventSubscribable!(runtime::ExecutionContextDestroyed => runtime_context_destroy_event_subscriber);
+SessionEventSubscribable!(runtime::ExecutionContextsCleared => runtime_contexts_cleared_event_subscriber);
 impl<W: Write, R: Read> Session<W, R>
 {
 	pub fn wait_message(&mut self) -> WebSocketResult<OwnedMessage>
@@ -110,30 +134,27 @@ impl<W: Write, R: Read> Session<W, R>
 				{
 					#[cfg(feature = "verbose")] println!("[wait_event]Received: {}", s);
 					// let obj: HashMap<_, _> = ::json_flex::decode(s).unwrap();
-					let parsed: JValue = serde_json::from_str(&s).unwrap();
-					if let Some(mtd) = parsed.get("method").and_then(JValue::as_str)
+					let mut parsed: JValue = serde_json::from_str(&s).unwrap();
+					let obj = parsed.as_object_mut().unwrap();
+					if Some(E::METHOD_NAME) == obj.get("method").and_then(JValue::as_str)
 					{
-						if mtd == page::FrameNavigated::METHOD_NAME
+						return Ok(E::deserialize(match obj.remove("params")
 						{
-							let e = page::FrameNavigated::deserialize(&parsed.get("params").unwrap());
-							for &call in &self.frame_navigated_event_subscriber { unsafe { &mut *call }.on_event(&e); }
-						}
-						if mtd == E::METHOD_NAME
-						{
-							return Ok(E::deserialize(&parsed.get("params").unwrap()));
-						}
+							Some(JValue::Object(o)) => o, _ => api_corruption!(value_type)
+						}));
 					}
-					else if let Some(e) = parsed.get("error")
+					if obj.contains_key("method") { self.handle_events(obj); }
+					if let Some(e) = obj.get("error")
 					{
 						return Err(From::from(format!("RPC Error({}): {} in processing id {}", e["code"].as_i64().unwrap(),
-							e["message"].as_str().unwrap(), parsed["id"].as_u64().unwrap())));
+							e["message"].as_str().unwrap(), obj["id"].as_u64().unwrap())));
 					}
 				},
 				_ => ()
 			}
 		}
 	}
-	pub fn wait_result(&mut self, id: usize) -> GenericResult<::serde_json::Value>
+	pub fn wait_result(&mut self, id: usize) -> GenericResult<JValue>
 	{
 		loop
 		{
@@ -143,21 +164,14 @@ impl<W: Write, R: Read> Session<W, R>
 				{
 					#[cfg(feature = "verbose")] println!("[wait_result]Received: {}", s);
 					// let mut obj: HashMap<_, _> = ::json_flex::decode(s).unwrap();
-					let mut parser: ::serde_json::Value = ::serde_json::from_str(&s).unwrap();
+					let mut parser: JValue = ::serde_json::from_str(&s).unwrap();
 					let obj = parser.as_object_mut().unwrap();
 					if obj.contains_key("result")
 					{
 						if obj["id"].as_u64() == Some(id as u64) { return Ok(obj.remove("result").unwrap()); }
 					}
-					else if let Some(mtd) = obj.get("method").and_then(JValue::as_str)
-					{
-						if mtd == page::FrameNavigated::METHOD_NAME
-						{
-							let e = page::FrameNavigated::deserialize(&obj.get("params").unwrap());
-							for &call in &self.frame_navigated_event_subscriber { unsafe { &mut *call }.on_event(&e); }
-						}
-					}
-					else if let Some(e) = obj.get("error")
+					if obj.contains_key("method") { self.handle_events(obj); }
+					if let Some(e) = obj.get("error")
 					{
 						return Err(From::from(format!("RPC Error({}): {} in processing id {}", e["code"].as_i64().unwrap(),
 							e["message"].as_str().unwrap(), obj["id"].as_u64().unwrap())));
@@ -165,6 +179,41 @@ impl<W: Write, R: Read> Session<W, R>
 				},
 				_ => ()
 			}
+		}
+	}
+	fn handle_events(&mut self, obj: &mut JMap<String, JValue>)
+	{
+		if Some(page::FrameNavigated::METHOD_NAME) == obj.get("method").and_then(JValue::as_str)
+		{
+			let e = page::FrameNavigated::deserialize(match obj.remove("params")
+			{
+				Some(JValue::Object(o)) => o, _ => api_corruption!(value_type)
+			});
+			for &call in &self.frame_navigated_event_subscriber { unsafe { &mut *call }.on_event(&e); }
+		}
+		else if Some(runtime::ExecutionContextCreated::METHOD_NAME) == obj.get("method").and_then(JValue::as_str)
+		{
+			let e = runtime::ExecutionContextCreated::deserialize(match obj.remove("params")
+			{
+				Some(JValue::Object(o)) => o, _ => api_corruption!(value_type)
+			});
+			for &call in &self.runtime_context_create_event_subscriber { unsafe { &mut *call }.on_event(&e); }
+		}
+		else if Some(runtime::ExecutionContextDestroyed::METHOD_NAME) == obj.get("method").and_then(JValue::as_str)
+		{
+			let e = runtime::ExecutionContextDestroyed::deserialize(match obj.remove("params")
+			{
+				Some(JValue::Object(o)) => o, _ => api_corruption!(value_type)
+			});
+			for &call in &self.runtime_context_destroy_event_subscriber { unsafe { &mut *call }.on_event(&e); }
+		}
+		else if Some(runtime::ExecutionContextsCleared::METHOD_NAME) == obj.get("method").and_then(JValue::as_str)
+		{
+			let e = runtime::ExecutionContextsCleared::deserialize(match obj.remove("params")
+			{
+				Some(JValue::Object(o)) => o, _ => api_corruption!(value_type)
+			});
+			for &call in &self.runtime_contexts_cleared_event_subscriber { unsafe { &mut *call }.on_event(&e); }
 		}
 	}
 	fn send_text(&mut self, text: String) -> WebSocketResult<()>
@@ -177,21 +226,16 @@ impl<W: Write, R: Read> Session<W, R>
 		self.send_text(::serde_json::to_string(payload).unwrap())
 	}
 }
-pub trait Event: Sized
-{
-	const METHOD_NAME: &'static str;
-	fn deserialize(res: &JValue) -> Self;
-}
 pub mod dom
 {
 	use std::io::prelude::*;
-	use serde_json::Value as JValue;
+	use serde_json::{Value as JValue, Map as JMap};
 
 	pub struct DocumentUpdated;
 	impl super::Event for DocumentUpdated
 	{
 		const METHOD_NAME: &'static str = "DOM.documentUpdated";
-		fn deserialize(_: &JValue) -> Self { DocumentUpdated }
+		fn deserialize(_: JMap<String, JValue>) -> Self { DocumentUpdated }
 	}
 
 	pub struct Node<'s, 'c: 's, W: Write + 'c, R: Read + 'c> { pub domain: &'s mut super::domain::DOM<'c, W, R>, pub id: isize }
@@ -209,13 +253,13 @@ pub mod dom
 		{
 			self.domain.focus_sync(1000, self.id).map(move |_| self)
 		}
-		pub fn attributes(&mut self) -> super::GenericResult<Vec<::serde_json::Value>>
+		pub fn attributes(&mut self) -> super::GenericResult<Vec<JValue>>
 		{
 			self.domain.get_attributes_sync(1000, self.id).map(|v| match v
 			{
-				::serde_json::Value::Object(mut o) => match o.remove("attributes")
+				JValue::Object(mut o) => match o.remove("attributes")
 				{
-					Some(::serde_json::Value::Array(v)) => v,
+					Some(JValue::Array(v)) => v,
 					_ => api_corruption!(value_type)
 				},
 				_ => api_corruption!(value_type)
@@ -226,13 +270,13 @@ pub mod dom
 #[allow(dead_code)]
 pub mod page
 {
-	use serde_json::Value as JValue;
+	use serde_json::{Value as JValue, Map as JMap};
 
 	pub struct LoadEventFired { timestamp: f64 }
 	impl super::Event for LoadEventFired
 	{
 		const METHOD_NAME: &'static str = "Page.loadEventFired";
-		fn deserialize(res: &JValue) -> Self
+		fn deserialize(res: JMap<String, JValue>) -> Self
 		{
 			LoadEventFired { timestamp: res["timestamp"].as_f64().unwrap() }
 		}
@@ -241,22 +285,29 @@ pub mod page
 	impl super::Event for FrameStoppedLoading
 	{
 		const METHOD_NAME: &'static str = "Page.frameStoppedLoading";
-		fn deserialize(res: &JValue) -> Self
+		fn deserialize(mut res: JMap<String, JValue>) -> Self
 		{
-			FrameStoppedLoading { frame_id: res["frameId"].as_str().unwrap().to_owned() }
+			FrameStoppedLoading
+			{
+				frame_id: match res.remove("frameId") { Some(JValue::String(s)) => s, _ => api_corruption!(value_type) }
+			}
 		}
 	}
 	pub struct FrameNavigated { pub frame_id: String, pub name: Option<String>, pub url: String }
 	impl super::Event for FrameNavigated
 	{
 		const METHOD_NAME: &'static str = "Page.frameNavigated";
-		fn deserialize(res: &JValue) -> Self
+		fn deserialize(mut res: JMap<String, JValue>) -> Self
 		{
-			FrameNavigated
+			match res.remove("frame")
 			{
-				frame_id: res["frame"]["id"].as_str().unwrap().to_owned(),
-				name: res["frame"]["name"].as_str().map(|x| x.to_owned()),
-				url: res["frame"]["url"].as_str().unwrap().to_owned()
+				Some(JValue::Object(mut f)) => FrameNavigated
+				{
+					frame_id: match f.remove("id") { Some(JValue::String(s)) => s, _ => api_corruption!(value_type) },
+					name: match f.remove("name") { Some(JValue::String(s)) => Some(s), None => None, _ => api_corruption!(value_type) },
+					url: match f.remove("url") { Some(JValue::String(s)) => s, _ => api_corruption!(value_type) }
+				},
+				_ => api_corruption!(value_type)
 			}
 		}
 	}
@@ -271,11 +322,50 @@ pub mod input
 	#[derive(Serialize)] #[serde(rename_all = "camelCase")]
 	pub enum KeyEvent { KeyDown, KeyUp, RawKeyDown, Char }
 }
+pub mod runtime
+{
+	use serde_json::{Value as JValue, Map as JMap};
+
+	pub struct ExecutionContextCreated { pub context_id: u64, pub name: String, pub aux: JValue }
+	impl super::Event for ExecutionContextCreated
+	{
+		const METHOD_NAME: &'static str = "Runtime.executionContextCreated";
+		fn deserialize(mut res: JMap<String, JValue>) -> Self
+		{
+			match res.remove("context")
+			{
+				Some(JValue::Object(mut ctx)) => ExecutionContextCreated
+				{
+					context_id: ctx["id"].as_u64().unwrap(),
+					name: match ctx.remove("name") { Some(JValue::String(s)) => s, _ => api_corruption!(value_type) },
+					aux: ctx.remove("auxData").unwrap()
+				},
+				_ => api_corruption!(value_type)
+			}
+		}
+	}
+	pub struct ExecutionContextDestroyed { pub context_id: u64 }
+	impl super::Event for ExecutionContextDestroyed
+	{
+		const METHOD_NAME: &'static str = "Runtime.executionContextDestroyed";
+		fn deserialize(res: JMap<String, JValue>) -> Self
+		{
+			ExecutionContextDestroyed { context_id: res["executionContextId"].as_u64().unwrap() }
+		}
+	}
+	pub struct ExecutionContextsCleared;
+	impl super::Event for ExecutionContextsCleared
+	{
+		const METHOD_NAME: &'static str = "Runtime.executionContextsCleared";
+		fn deserialize(_: JMap<String, JValue>) -> Self { ExecutionContextsCleared }
+	}
+}
 pub mod domain
 {
 	use super::Session;
 	use std::io::prelude::*;
 	use websocket::WebSocketResult;
+	use serde_json::Value as JValue;
 
 	pub struct DOM<'c, W: Write + 'c, R: Read + 'c>(pub &'c mut Session<W, R>);
 	impl<'c, W: Write + 'c, R: Read + 'c> DOM<'c, W, R>
@@ -315,7 +405,7 @@ pub mod domain
 			self.0.send(&Payload { method: "DOM.getAttributes", id, params: Params { node_id } })
 		}
 
-		pub fn get_document_sync(&mut self, id: usize) -> super::GenericResult<::serde_json::Value>
+		pub fn get_document_sync(&mut self, id: usize) -> super::GenericResult<JValue>
 		{
 			self.get_document(id).map_err(From::from).and_then(|_| self.0.wait_result(id))
 		}
@@ -328,13 +418,13 @@ pub mod domain
 			self.query_selector(id, node_id, selector).map_err(From::from).and_then(|_| self.0.wait_result(id))
 				.map(|o| o["nodeId"].as_i64().unwrap() as isize)
 		}
-		pub fn query_selector_all_sync(&mut self, id: usize, node_id: isize, selector: &str) -> super::GenericResult<Vec<::serde_json::Value>>
+		pub fn query_selector_all_sync(&mut self, id: usize, node_id: isize, selector: &str) -> super::GenericResult<Vec<JValue>>
 		{
 			self.query_selector_all(id, node_id, selector).map_err(From::from).and_then(|_| self.0.wait_result(id)).map(|o| match o
 			{
-				::serde_json::Value::Object(mut o) => match o.remove("nodeIds")
+				JValue::Object(mut o) => match o.remove("nodeIds")
 				{
-					Some(::serde_json::Value::Array(v)) => v,
+					Some(JValue::Array(v)) => v,
 					_ => api_corruption!(value_type)
 				},
 				_ => api_corruption!(value_type)
@@ -344,7 +434,7 @@ pub mod domain
 		{
 			self.focus(id, node_id).map_err(From::from).and_then(|_| self.0.wait_result(id)).map(|_| ())
 		}
-		pub fn get_attributes_sync(&mut self, id: usize, node_id: isize) -> super::GenericResult<::serde_json::Value>
+		pub fn get_attributes_sync(&mut self, id: usize, node_id: isize) -> super::GenericResult<JValue>
 		{
 			self.get_attributes(id, node_id).map_err(From::from).and_then(|_| self.0.wait_result(id))
 		}
@@ -401,7 +491,7 @@ pub mod domain
 		{
 			self.navigate(id, url).map_err(From::from).and_then(|_| self.0.wait_result(id)).map(|_| ())
 		}
-		pub fn get_resource_tree_sync(&mut self, id: usize) -> super::GenericResult<::serde_json::Value>
+		pub fn get_resource_tree_sync(&mut self, id: usize) -> super::GenericResult<JValue>
 		{
 			self.get_resource_tree(id).map_err(From::from).and_then(|_| self.0.wait_result(id))
 		}
@@ -421,10 +511,10 @@ pub mod domain
 			self.0.send(&Payload { method: "Runtime.evaluate", id, params: Params { expression } })
 		}
 		#[allow(dead_code)]
-		pub fn evaluate_in(&mut self, id: usize, context_id: i64, expression: &str) -> WebSocketResult<()>
+		pub fn evaluate_in(&mut self, id: usize, context_id: u64, expression: &str) -> WebSocketResult<()>
 		{
 			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: usize, params: Params<'s> }
-			#[derive(Serialize)] #[serde(rename_all = "camelCase")] struct Params<'s> { expression: &'s str, context_id: i64 }
+			#[derive(Serialize)] #[serde(rename_all = "camelCase")] struct Params<'s> { expression: &'s str, context_id: u64 }
 			self.0.send(&Payload { method: "Runtime.evaluate", id, params: Params { expression, context_id } })
 		}
 		pub fn evaluate_value(&mut self, id: usize, expression: &str) -> WebSocketResult<()>
@@ -433,6 +523,12 @@ pub mod domain
 			#[derive(Serialize)] #[serde(rename_all = "camelCase")] struct Params<'s> { expression: &'s str, return_by_value: bool }
 			self.0.send(&Payload { method: "Runtime.evaluate", id, params: Params { expression, return_by_value: true } })
 		}
+		pub fn evaluate_value_in(&mut self, id: usize, context_id: u64, expression: &str) -> WebSocketResult<()>
+		{
+			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: usize, params: Params<'s> }
+			#[derive(Serialize)] #[serde(rename_all = "camelCase")] struct Params<'s> { expression: &'s str, return_by_value: bool, context_id: u64 }
+			self.0.send(&Payload { method: "Runtime.evaluate", id, params: Params { expression, return_by_value: true, context_id } })
+		}
 		pub fn get_properties(&mut self, id: usize, object_id: &str) -> WebSocketResult<()>
 		{
 			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: usize, params: Params<'s> }
@@ -440,22 +536,44 @@ pub mod domain
 			self.0.send(&Payload { method: "Runtime.getProperties", id, params: Params { object_id } })
 		}
 
-		pub fn evaluate_sync(&mut self, id: usize, expression: &str) -> super::GenericResult<::serde_json::Value>
+		pub fn evaluate_sync(&mut self, id: usize, expression: &str) -> super::GenericResult<JValue>
 		{
 			self.evaluate(id, expression).map_err(From::from).and_then(|_| self.0.wait_result(id))
 		}
 		#[allow(dead_code)]
-		pub fn evaluate_in_sync(&mut self, id: usize, context_id: i64, expression: &str) -> super::GenericResult<::serde_json::Value>
+		pub fn evaluate_in_sync(&mut self, id: usize, context_id: u64, expression: &str) -> super::GenericResult<JValue>
 		{
 			self.evaluate_in(id, context_id, expression).map_err(From::from).and_then(|_| self.0.wait_result(id))
 		}
-		pub fn evaluate_value_sync(&mut self, id: usize, expression: &str) -> super::GenericResult<::serde_json::Value>
+		pub fn evaluate_value_sync(&mut self, id: usize, expression: &str) -> super::GenericResult<JValue>
 		{
 			self.evaluate_value(id, expression).map_err(From::from).and_then(|_| self.0.wait_result(id))
 		}
-		pub fn get_properties_sync(&mut self, id: usize, object_id: &str) -> super::GenericResult<::serde_json::Value>
+		pub fn evaluate_value_in_sync(&mut self, id: usize, context_id: u64, expression: &str) -> super::GenericResult<JValue>
+		{
+			self.evaluate_value_in(id, context_id, expression).map_err(From::from).and_then(|_| self.0.wait_result(id))
+		}
+		pub fn get_properties_sync(&mut self, id: usize, object_id: &str) -> super::GenericResult<JValue>
 		{
 			self.get_properties(id, object_id).map_err(From::from).and_then(|_| self.0.wait_result(id))
+		}
+	}
+
+	/// Event Handlable
+	impl<'c, W: Write + 'c, R: Read + 'c> Runtime<'c, W, R>
+	{
+		/// Enables reporting of execution contexts creation by means of `executionContextCreated` event.
+		/// When the reporting gets enabled the event will be sent immediately for each existing execution context.
+		pub fn enable(&mut self, id: usize) -> WebSocketResult<()>
+		{
+			#[derive(Serialize)] struct Payload { method: &'static str, id: usize }
+			self.0.send(&Payload { method: "Runtime.enable", id })
+		}
+		/// Disables reporting of execution contexts creation
+		pub fn disable(&mut self, id: usize) -> WebSocketResult<()>
+		{
+			#[derive(Serialize)] struct Payload { method: &'static str, id: usize }
+			self.0.send(&Payload { method: "Runtime.disable", id })
 		}
 	}
 }
