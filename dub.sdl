@@ -3,3 +3,6 @@ description "DigitalCampus 2017 Prototype"
 authors "S.Percentage"
 copyright "Copyright 2017 S.Percentage"
 license "MIT"
+
+dependency "vibe-d:http" version="~>0.8"
+versions "VibeNoSSL"
