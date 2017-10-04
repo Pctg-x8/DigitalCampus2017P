@@ -12,3 +12,4 @@ dc2017p-test-*
 *.o
 *.obj
 *.lst
+*.dll
