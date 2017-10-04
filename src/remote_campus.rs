@@ -603,12 +603,12 @@ impl CampusPlanFrames<AttendanceDetailsPage>
 		{
 			subjects.push(SubjectAttendanceState
 			{
-				code: res_values.remove(0).as_str().unwrap().trim().to_owned(),
-				name: res_values.remove(0).as_str().unwrap().trim().to_owned(),
-				period: Period::from_str(res_values.remove(0).as_str().unwrap().trim()).unwrap(),
-				week: Week::from_str(res_values.remove(0).as_str().unwrap().trim()).unwrap(),
-				time: parse_opening_time(re_nums.find(res_values.remove(0).as_str().unwrap().trim()).unwrap().as_str()),
-				rate: re_floatings.find(res_values.remove(0).as_str().unwrap().trim()).unwrap().as_str().parse().unwrap(),
+				code: res_values.remove(0).as_str().unwrap().to_owned(),
+				name: res_values.remove(0).as_str().unwrap().to_owned(),
+				period: Period::from_str(res_values.remove(0).as_str().unwrap()).unwrap(),
+				week: Week::from_str(res_values.remove(0).as_str().unwrap()).unwrap(),
+				time: parse_opening_time(re_nums.find(res_values.remove(0).as_str().unwrap()).unwrap().as_str()),
+				rate: re_floatings.find(res_values.remove(0).as_str().unwrap()).unwrap().as_str().parse().unwrap(),
 				attendance_cells: res_values.drain(..15).map(|s|
 				{
 					let s = s.as_str().unwrap();
@@ -628,23 +628,27 @@ impl CampusPlanFrames<AttendanceDetailsPage>
 		Ok(subjects)
 	}
 	/// 期間別出席率テーブルの取得
-	pub fn parse_attendance_rates(&mut self) -> GenericResult<PeriodAttendanceRates>
+	pub fn parse_attendance_rates(&mut self) -> GenericResult<Vec<PeriodAttendanceRate>>
 	{
 		let rctx = Some(self.main_frame_context());
-		let res_values: Vec<_> = self.remote.query_value(rctx, &format!(r#"
+		self.remote.query_value(rctx, &format!(r#"
+			function toPeriod(s) {{
+				switch(s) {{
+				case "1 Q": return "FirstQuarter"; case "2 Q": return "SecondQuarter";
+				case "3 Q": return "ThirdQuarter";  case "4 Q": return "FourthQuarter";
+				case "前期": return "FirstStage"; case "後期": return "LateStage";
+				case "通年": return "WholeYear"; default: console.assert(false);
+				}}
+			}}
 			var table = document.getElementById({:?});
-			var rows = table.querySelectorAll("tr:not(:first-child) td");
-			Array.prototype.map.call(rows, x => x.textContent.trim())
-		"#, Self::BY_PERIOD_TABLE_ID))?.strip_value();
-
-		let re_floatings = Regex::new(r"\d+(.\d)?").unwrap();
-		Ok(PeriodAttendanceRates
-		{
-			first_year: res_values[0].as_str().unwrap().trim().parse().unwrap(),
-			starting_period: Period::from_str(res_values[1].as_str().unwrap().trim()).unwrap(),
-			rates: res_values.into_iter().skip(2).step_by(3).map(|rs| re_floatings.find(rs.as_str().unwrap().trim()).unwrap().as_str().parse().unwrap())
-				.collect()
-		})
+			var cells = Array.prototype.map.call(table.querySelectorAll("tr:not(:first-child) td"), x => x.textContent.trim());
+			var ret = [];
+			for(var i = 0; i < cells.length; i += 3) {{
+				var row = cells.slice(i, i + 3);
+				ret.push({{firstYear: parseInt(row[0]), startingPeriod: toPeriod(row[1]), rates: parseFloat(row[2].substring(row[2].search(/\d+(\.\d+)?/)))}});
+			}}
+			JSON.stringify(ret)
+		"#, Self::BY_PERIOD_TABLE_ID)).map(|mut x| serde_json::from_str(&x.strip_value::<String>()).unwrap())
 	}
 }
 /// 出欠テーブル: 科目行
@@ -661,11 +665,11 @@ pub struct SubjectAttendanceState
 }
 /// 出席率テーブル
 #[derive(Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
-pub struct PeriodAttendanceRates
+pub struct PeriodAttendanceRate
 {
 	#[doc = "初年度"] pub first_year: u32,
 	#[doc = "開始時期"] pub starting_period: Period,
-	#[doc = "出席率"] pub rates: Vec<f32>
+	#[doc = "出席率"] pub rates: f32
 }
 /// 開講時期
 #[derive(Serialize, Deserialize)]
