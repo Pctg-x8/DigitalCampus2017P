@@ -1,0 +1,14 @@
+.dub
+docs.json
+__dummy.html
+docs/
+dc2017p.so
+dc2017p.dylib
+dc2017p.dll
+dc2017p.a
+dc2017p.lib
+dc2017p-test-*
+*.exe
+*.o
+*.obj
+*.lst
