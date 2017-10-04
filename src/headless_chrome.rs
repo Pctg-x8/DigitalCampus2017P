@@ -71,10 +71,7 @@ pub trait Event: Sized
 pub struct Session<W: Write, R: Read>
 {
 	sender: WebSocketWriter<W>, receiver: WebSocketReader<R>,
-	frame_navigated_event_subscriber: Vec<*mut SessionEventSubscriber<page::FrameNavigated>>,
-	runtime_context_create_event_subscriber: Vec<*mut SessionEventSubscriber<runtime::ExecutionContextCreated>>,
-	runtime_context_destroy_event_subscriber: Vec<*mut SessionEventSubscriber<runtime::ExecutionContextDestroyed>>,
-	runtime_contexts_cleared_event_subscriber: Vec<*mut SessionEventSubscriber<runtime::ExecutionContextsCleared>>
+	frame_navigated_event_subscriber: Vec<*mut SessionEventSubscriber<page::FrameNavigated>>
 }
 impl Session<TcpStream, TcpStream>
 {
@@ -84,12 +81,11 @@ impl Session<TcpStream, TcpStream>
 		let (recv, send) = ws_client.split()?;
 		Ok(Session
 		{
-			sender: send, receiver: recv,
-			frame_navigated_event_subscriber: Vec::new(), runtime_context_create_event_subscriber: Vec::new(),
-			runtime_context_destroy_event_subscriber: Vec::new(), runtime_contexts_cleared_event_subscriber: Vec::new()
+			sender: send, receiver: recv, frame_navigated_event_subscriber: Vec::new()
 		})
 	}
 }
+/// Session associated domains
 impl<W: Write, R: Read> Session<W, R>
 {
 	pub fn dom(&mut self) -> domain::DOM<W, R> { domain::DOM(self) }
@@ -115,42 +111,44 @@ macro_rules! SessionEventSubscribable
 	}
 }
 SessionEventSubscribable!(page::FrameNavigated => frame_navigated_event_subscriber);
-SessionEventSubscribable!(runtime::ExecutionContextCreated => runtime_context_create_event_subscriber);
-SessionEventSubscribable!(runtime::ExecutionContextDestroyed => runtime_context_destroy_event_subscriber);
-SessionEventSubscribable!(runtime::ExecutionContextsCleared => runtime_contexts_cleared_event_subscriber);
 impl<W: Write, R: Read> Session<W, R>
 {
 	pub fn wait_message(&mut self) -> WebSocketResult<OwnedMessage>
 	{
 		self.receiver.recv_message::<DummyIterator>()
 	}
-	pub fn wait_event<E: Event>(&mut self) -> GenericResult<E>
+	pub fn wait_text(&mut self) -> WebSocketResult<String>
 	{
 		loop
 		{
 			match self.wait_message()?
 			{
-				OwnedMessage::Text(s) =>
-				{
-					#[cfg(feature = "verbose")] println!("[wait_event]Received: {}", s);
-					// let obj: HashMap<_, _> = ::json_flex::decode(s).unwrap();
-					let mut parsed: JValue = serde_json::from_str(&s).unwrap();
-					let obj = parsed.as_object_mut().unwrap();
-					if Some(E::METHOD_NAME) == obj.get("method").and_then(JValue::as_str)
-					{
-						return Ok(E::deserialize(match obj.remove("params")
-						{
-							Some(JValue::Object(o)) => o, _ => api_corruption!(value_type)
-						}));
-					}
-					if obj.contains_key("method") { self.handle_events(obj); }
-					if let Some(e) = obj.get("error")
-					{
-						return Err(From::from(format!("RPC Error({}): {} in processing id {}", e["code"].as_i64().unwrap(),
-							e["message"].as_str().unwrap(), obj["id"].as_u64().unwrap())));
-					}
-				},
+				OwnedMessage::Text(s) => return Ok(s),
 				_ => ()
+			}
+		}
+	}
+	pub fn wait_event<E: Event>(&mut self) -> GenericResult<E>
+	{
+		loop
+		{
+			let s = self.wait_text()?;
+			#[cfg(feature = "verbose")] println!("[wait_event]Received: {}", s);
+			// let obj: HashMap<_, _> = ::json_flex::decode(s).unwrap();
+			let mut parsed: JValue = serde_json::from_str(&s).unwrap();
+			let obj = parsed.as_object_mut().unwrap();
+			if Some(E::METHOD_NAME) == obj.get("method").and_then(JValue::as_str)
+			{
+				return Ok(E::deserialize(match obj.remove("params")
+				{
+					Some(JValue::Object(o)) => o, _ => api_corruption!(value_type)
+				}));
+			}
+			if obj.contains_key("method") { self.handle_events(obj); }
+			if let Some(e) = obj.get("error")
+			{
+				return Err(From::from(format!("RPC Error({}): {} in processing id {}", e["code"].as_i64().unwrap(),
+					e["message"].as_str().unwrap(), obj["id"].as_u64().unwrap())));
 			}
 		}
 	}
@@ -158,26 +156,20 @@ impl<W: Write, R: Read> Session<W, R>
 	{
 		loop
 		{
-			match self.wait_message()?
+			let s = self.wait_text()?;
+			#[cfg(feature = "verbose")] println!("[wait_result]Received: {}", s);
+			// let mut obj: HashMap<_, _> = ::json_flex::decode(s).unwrap();
+			let mut parser: JValue = ::serde_json::from_str(&s).unwrap();
+			let obj = parser.as_object_mut().unwrap();
+			if obj.contains_key("result")
 			{
-				OwnedMessage::Text(s) =>
-				{
-					#[cfg(feature = "verbose")] println!("[wait_result]Received: {}", s);
-					// let mut obj: HashMap<_, _> = ::json_flex::decode(s).unwrap();
-					let mut parser: JValue = ::serde_json::from_str(&s).unwrap();
-					let obj = parser.as_object_mut().unwrap();
-					if obj.contains_key("result")
-					{
-						if obj["id"].as_u64() == Some(id as u64) { return Ok(obj.remove("result").unwrap()); }
-					}
-					if obj.contains_key("method") { self.handle_events(obj); }
-					if let Some(e) = obj.get("error")
-					{
-						return Err(From::from(format!("RPC Error({}): {} in processing id {}", e["code"].as_i64().unwrap(),
-							e["message"].as_str().unwrap(), obj["id"].as_u64().unwrap())));
-					}
-				},
-				_ => ()
+				if obj["id"].as_u64() == Some(id as u64) { return Ok(obj.remove("result").unwrap()); }
+			}
+			if obj.contains_key("method") { self.handle_events(obj); }
+			if let Some(e) = obj.get("error")
+			{
+				return Err(From::from(format!("RPC Error({}): {} in processing id {}", e["code"].as_i64().unwrap(),
+					e["message"].as_str().unwrap(), obj["id"].as_u64().unwrap())));
 			}
 		}
 	}
@@ -191,34 +183,11 @@ impl<W: Write, R: Read> Session<W, R>
 			});
 			for &call in &self.frame_navigated_event_subscriber { unsafe { &mut *call }.on_event(&e); }
 		}
-		else if Some(runtime::ExecutionContextCreated::METHOD_NAME) == obj.get("method").and_then(JValue::as_str)
-		{
-			let e = runtime::ExecutionContextCreated::deserialize(match obj.remove("params")
-			{
-				Some(JValue::Object(o)) => o, _ => api_corruption!(value_type)
-			});
-			for &call in &self.runtime_context_create_event_subscriber { unsafe { &mut *call }.on_event(&e); }
-		}
-		else if Some(runtime::ExecutionContextDestroyed::METHOD_NAME) == obj.get("method").and_then(JValue::as_str)
-		{
-			let e = runtime::ExecutionContextDestroyed::deserialize(match obj.remove("params")
-			{
-				Some(JValue::Object(o)) => o, _ => api_corruption!(value_type)
-			});
-			for &call in &self.runtime_context_destroy_event_subscriber { unsafe { &mut *call }.on_event(&e); }
-		}
-		else if Some(runtime::ExecutionContextsCleared::METHOD_NAME) == obj.get("method").and_then(JValue::as_str)
-		{
-			let e = runtime::ExecutionContextsCleared::deserialize(match obj.remove("params")
-			{
-				Some(JValue::Object(o)) => o, _ => api_corruption!(value_type)
-			});
-			for &call in &self.runtime_contexts_cleared_event_subscriber { unsafe { &mut *call }.on_event(&e); }
-		}
 	}
 	fn send_text(&mut self, text: String) -> WebSocketResult<()>
 	{
 		// println!("Sending {}", text);
+		#[cfg(feature = "verbose")] println!("[send]Sending: {}", text);
 		self.sender.send_message(&OwnedMessage::Text(text))
 	}
 	fn send<T: Serialize>(&mut self, payload: &T) -> WebSocketResult<()>

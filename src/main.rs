@@ -117,12 +117,11 @@ fn main()
 		else { process_login(e) }
 	});
 	// println!("履修ページへアクセスしています...");
-	let mut intersysmenu = pctrl.jump_into_intersys().unwrap();
+	let intersysmenu = pctrl.access_intersys().unwrap();
 	// let mut intersysmenu = pctrl.jump_into_intersys().unwrap().isolate_mainframe().unwrap();
 
 	// 学生プロファイルと履修科目テーブル
-	/*let mut cdetails = intersysmenu.interrupt().unwrap().jump_into_course_category().unwrap().isolate_mainframe_stealing_load().unwrap()
-		.jump_into_course_details().unwrap();
+	/*let mut cdetails = intersysmenu.access_course_category().unwrap().access_details().unwrap();
 	let profile = cdetails.parse_profile().unwrap();
 	/*println!("=== 学生プロファイル ===");
 	println!("** 学籍番号: {}", profile.id);
@@ -137,7 +136,7 @@ fn main()
 	// 出席率を取りたい
 	/*let mut adetails = intersysmenu./*activate(cdetails.leave()).unwrap().*/jump_into_attendance_category().unwrap().isolate_mainframe_stealing_load().unwrap()
 		.jump_into_details().unwrap();*/
-	let mut adetails = intersysmenu.jump_into_attendance_category().unwrap().jump_into_details().unwrap();
+	let mut adetails = intersysmenu.access_attendance_category().unwrap().access_details().unwrap();
 	println!("{}", serde_json::to_string(&adetails.parse_current_year_table().unwrap()).unwrap());
 	println!("{}", serde_json::to_string(&adetails.parse_attendance_rates().unwrap()).unwrap());
 }
