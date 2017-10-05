@@ -3,14 +3,14 @@
 #![allow(dead_code)]
 
 use {headless_chrome, GenericResult};
-use headless_chrome::{SessionEventSubscriber, SessionEventSubscribable, Event, RequestID};
+use headless_chrome::{Event, RequestID};
 use std::net::TcpStream;
 use serde_json;
 use serde_json::{Value as JValue, Map as JMap};
 use std::marker::PhantomData;
 use std::mem::{replace, transmute};
 
-use headless_chrome::runtime;
+use headless_chrome::{page, runtime};
 // use headless_chrome::runtime::JSONTyping;
 
 pub trait QueryValueType<T: Sized>: Sized { fn unwrap(self) -> T; }
@@ -24,20 +24,22 @@ impl QueryValueType<Vec<JValue>> for JValue
 }
 impl QueryValueType<String> for JValue { fn unwrap(self) -> String { jvDecomposite!{ self => string[v]: v } } }
 
+fn frame_navigated(e: &page::FrameNavigated)
+{
+	if let Some(n) = e.frame.name.as_ref() { println!("FrameNavigated: {} in {}", e.frame.url, n); }
+	else { println!("FrameNavigated: {}", e.frame.url); }
+}
+
 pub struct RemoteCampus { session: headless_chrome::Session<TcpStream, TcpStream>, request_id: RequestID }
 impl RemoteCampus
 {
 	pub fn connect(addr: &str) -> GenericResult<Self>
 	{
 		let mut object = headless_chrome::Session::connect(addr).map(|session| RemoteCampus { session, request_id: 1 })?;
-		unsafe
-		{
-			let objptr: *mut RemoteCampus = &object as *const _ as *mut _;
-			(&mut object.session as &mut SessionEventSubscribable<headless_chrome::page::FrameNavigated>).subscribe_session_event_raw(objptr);
-		}
-		object.session.page().enable(0).unwrap(); object.session.wait_result(0).unwrap();
-		object.session.dom().enable(0).unwrap(); object.session.wait_result(0).unwrap();
-		object.session.runtime().enable(0).unwrap(); object.session.wait_result(0).unwrap();
+		object.session.subscribe_session_event(&frame_navigated);
+		object.session.page().enable(0)?; object.session.wait_result(0)?;
+		object.session.dom().enable(0)?; object.session.wait_result(0)?;
+		object.session.runtime().enable(0)?; object.session.wait_result(0)?;
 		Ok(object)
 	}
 	fn new_request_id(&mut self) -> RequestID
@@ -81,21 +83,17 @@ impl RemoteCampus
 		}
 		else { Ok(q.result) }
 	}
-	pub fn query_page_location(&mut self) -> GenericResult<String>
+	pub fn query_page_location(&mut self, cid: Option<u64>) -> GenericResult<String>
 	{
-		self.query_value(None, "location.href").map(runtime::RemoteObject::assume_string)
-	}
-	pub fn query_page_location_in(&mut self, cid: u64) -> GenericResult<String>
-	{
-		self.query_value(Some(cid), "location.href").map(runtime::RemoteObject::assume_string)
+		self.query_value(cid, "location.href").map(runtime::RemoteObject::assume_string)
 	}
 	pub fn is_in_login_page(&mut self) -> GenericResult<bool>
 	{
-		Ok(self.query_page_location()?.contains("/campuslogin"))
+		Ok(self.query_page_location(None)?.contains("/campuslogin"))
 	}
 	pub fn is_in_home(&mut self) -> GenericResult<bool>
 	{
-		Ok(self.query_page_location()?.contains("/campusHomepage"))
+		Ok(self.query_page_location(None)?.contains("/campusHomepage"))
 	}
 
 	pub fn click_element(&mut self, context: Option<u64>, selector: &str) -> GenericResult<&mut Self>
@@ -114,20 +112,6 @@ impl RemoteCampus
 	pub fn wait_loading(&mut self) -> GenericResult<&mut Self>
 	{
 		self.session.wait_event::<headless_chrome::page::LoadEventFired>().map(move |_| self)
-	}
-}
-impl SessionEventSubscriber<headless_chrome::page::FrameNavigated> for RemoteCampus
-{
-	fn on_event(&mut self, event: &headless_chrome::page::FrameNavigated)
-	{
-		if let Some(n) = event.name.as_ref()
-		{
-			println!("FrameNavigated: {} in {}", event.url, n);
-		}
-		else
-		{
-			println!("FrameNavigated: {}", event.url);
-		}
 	}
 }
 
@@ -255,7 +239,7 @@ macro_rules! SessionEventLoop
 	{
 		if $name == $($ee::)+METHOD_NAME
 		{
-			if ($x)($($ee::)+deserialize($params)).require_break() { break; }
+			if ($x)(serde_json::from_value::<$($ee)::+>($params)?).require_break() { break; }
 		}
 	};
 	{ __SessionMatcher($name: expr, $params: expr) $($ee: ident)::+ => break; $($rest: tt)* } =>
@@ -267,7 +251,7 @@ macro_rules! SessionEventLoop
 	{
 		if $name == $($ee::)+METHOD_NAME
 		{
-			if ($x)($($ee::)+deserialize($params)).require_break() { break; }
+			if ($x)(serde_json::from_value::<$($ee)::+>($params)?).require_break() { break; }
 		}
 		else { SessionEventLoop!{ __SessionMatcher($name, $params) $($rest)* } }
 	};
@@ -311,7 +295,7 @@ impl<MainFrameCtrlTy: PageControl, MenuFrameCtrlTy: PageControl> CampusPlanFrame
 	fn is_blank_main(&mut self) -> GenericResult<bool>
 	{
 		let cid = self.main_frame_context();
-		self.remote.query_page_location_in(cid).map(|l| l.contains("/blank.html"))
+		self.remote.query_page_location(Some(cid)).map(|l| l.contains("/blank.html"))
 	}
 }
 
@@ -325,35 +309,38 @@ impl<MainFrameCtrlTy: PageControl, MenuFrameCtrlTy: PageControl> CampusPlanFrame
 
 		SessionEventLoop!(self.remote.session;
 		{
-			headless_chrome::page::FrameNavigated => |e: headless_chrome::page::FrameNavigated|
+			page::FrameNavigatedOwned => |e: page::FrameNavigatedOwned|
 			{
-				self.remote.session.dispatch_frame_navigated(&e);
-				match e.name.as_ref().map(|s| s as &str)
+				self.remote.session.dispatch_frame_navigated(&e.borrow());
+				match e.frame.name.as_ref().map(|s| s as &str)
 				{
-					Some("MainFrame") => { self.ctx_main_frame.navigated(e.frame_id); },
-					Some("MenuFrame") => { self.ctx_menu_frame.navigated(e.frame_id); },
+					Some("MainFrame") => { self.ctx_main_frame.navigated(e.frame.id); },
+					Some("MenuFrame") => { self.ctx_menu_frame.navigated(e.frame.id); },
 					_ => ()
 				}
 			};
-			headless_chrome::runtime::ExecutionContextCreated => |e: headless_chrome::runtime::ExecutionContextCreated|
+			runtime::ExecutionContextCreated => |e: runtime::ExecutionContextCreated|
 			{
-				if let Some(fid) = e.aux.get("frameId").and_then(JValue::as_str)
+				if let Some(aux) = e.context.aux_data
 				{
-					self.ctx_main_frame.try_attach_context(fid, e.context_id);
-					self.ctx_menu_frame.try_attach_context(fid, e.context_id);
+					if let Some(fid) = aux.get("frameId").and_then(JValue::as_str)
+					{
+						self.ctx_main_frame.try_attach_context(fid, e.context.id);
+						self.ctx_menu_frame.try_attach_context(fid, e.context.id);
+					}
 				}
 			};
-			headless_chrome::runtime::ExecutionContextDestroyed => |e: headless_chrome::runtime::ExecutionContextDestroyed|
+			runtime::ExecutionContextDestroyed => |e: runtime::ExecutionContextDestroyed|
 			{
-				if Some(e.context_id) == self.ctx_main_frame.contextid() { self.ctx_main_frame.detach_context(); }
-				if Some(e.context_id) == self.ctx_menu_frame.contextid() { self.ctx_menu_frame.detach_context(); }
+				if Some(e.execution_context_id) == self.ctx_main_frame.contextid() { self.ctx_main_frame.detach_context(); }
+				if Some(e.execution_context_id) == self.ctx_menu_frame.contextid() { self.ctx_menu_frame.detach_context(); }
 			};
-			headless_chrome::runtime::ExecutionContextsCleared => |_|
+			runtime::ExecutionContextsCleared => |_|
 			{
 				self.ctx_main_frame.detach_context();
 				self.ctx_menu_frame.detach_context();
 			};
-			headless_chrome::page::FrameStoppedLoading => |e: headless_chrome::page::FrameStoppedLoading|
+			page::FrameStoppedLoadingOwned => |e: page::FrameStoppedLoadingOwned|
 			{
 				main_completion = main_completion || self.ctx_main_frame.frameid() == Some(&e.frame_id);
 				menu_completion = menu_completion || self.ctx_menu_frame.frameid() == Some(&e.frame_id);

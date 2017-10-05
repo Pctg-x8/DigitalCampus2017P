@@ -14,8 +14,9 @@ use std::io::prelude::{Write, Read};
 use std::net::TcpStream;
 use std::io::{Result as IOResult, ErrorKind as IOErrorKind};
 use std::mem::transmute_copy;
-use serde_json::{Value as JValue, Map as JMap}; use serde_json;
+use serde_json::{Value as JValue}; use serde_json;
 use GenericResult;
+use serde::de::DeserializeOwned;
 
 // primitives
 pub type RequestID = u64;
@@ -44,34 +45,17 @@ impl Iterator for DummyIterator
 }
 
 /// Subscribes an event of `E`
-pub trait SessionEventSubscriber<E: Event>
+pub trait FrameNavigatedEventSubscriber
 {
-	fn on_event(&mut self, event: &E);
+	fn on_event(&mut self, event: &page::FrameNavigated);
 }
-impl<F, E: Event> SessionEventSubscriber<E> for F where F: FnMut(&E)
+impl<F> FrameNavigatedEventSubscriber for F where F: for<'r> FnMut(&'r page::FrameNavigated)
 {
-	fn on_event(&mut self, event: &E) { self(event) }
-}
-/// Allows subscribing events
-pub trait SessionEventSubscribable<E: Event>
-{
-	unsafe fn subscribe_session_event_raw(&mut self, subscriber: *mut SessionEventSubscriber<E>);
-	unsafe fn unsubscribe_session_event_raw(&mut self, subscriber: *mut SessionEventSubscriber<E>);
-	fn subscribe_session_event(&mut self, subscriber: &SessionEventSubscriber<E>)
-	{
-		unsafe { self.subscribe_session_event_raw(subscriber as *const _ as *mut _) }
-	}
-	fn unsubscribe_session_event(&mut self, subscriber: &SessionEventSubscriber<E>)
-	{
-		unsafe { self.unsubscribe_session_event_raw(subscriber as *const _ as *mut _) }
-	}
+	fn on_event(&mut self, event: &page::FrameNavigated) { self(event) }
 }
 pub trait Event: Sized
 {
 	const METHOD_NAME: &'static str;
-	fn deserialize(res: JMap<String, JValue>) -> Self;
-
-	fn assert_frame_navigated(self) -> page::FrameNavigated { panic!("Not a FrameNavigated"); }
 }
 
 #[derive(Deserialize)] #[serde(untagged)]
@@ -79,7 +63,7 @@ pub enum SessionReceiveEvent<'s>
 {
 	Result { id: RequestID, result: JValue },
 	Error { id: RequestID, error: ErrorDescription<'s> },
-	Method { method: &'s str, params: JMap<String, JValue> }
+	Method { method: &'s str, params: JValue }
 }
 #[derive(Deserialize)]
 pub struct ErrorDescription<'s> { code: i64, message: &'s str }
@@ -98,7 +82,7 @@ impl<'s> SessionReceiveEvent<'s>
 pub struct Session<W: Write, R: Read>
 {
 	sender: WebSocketWriter<W>, receiver: WebSocketReader<R>,
-	frame_navigated_event_subscriber: Vec<*mut SessionEventSubscriber<page::FrameNavigated>>
+	frame_navigated_event_subscriber: Vec<*mut FrameNavigatedEventSubscriber>
 }
 impl Session<TcpStream, TcpStream>
 {
@@ -120,24 +104,20 @@ impl<W: Write, R: Read> Session<W, R>
 	pub fn page(&mut self) -> domain::Page<W, R> { domain::Page(self) }
 	pub fn runtime(&mut self) -> domain::Runtime<W, R> { domain::Runtime(self) }
 }
-macro_rules! SessionEventSubscribable
+impl<W: Write, R: Read> Session<W, R>
 {
-	($t: ty => $v: ident) =>
+	pub fn subscribe_session_event(&mut self, subscriber: &'static FrameNavigatedEventSubscriber)
 	{
-		impl<W: Write, R: Read> SessionEventSubscribable<$t> for Session<W, R>
+		self.frame_navigated_event_subscriber.push(subscriber as *const _ as *mut _);
+	}
+	pub fn unsubscribe_session_event(&mut self, subscriber: &'static FrameNavigatedEventSubscriber)
+	{
+		if let Some(index) = self.frame_navigated_event_subscriber.iter().position(|&x| x == subscriber as *const _ as *mut _)
 		{
-			unsafe fn subscribe_session_event_raw(&mut self, subscriber: *mut SessionEventSubscriber<$t>)
-			{
-				self.$v.push(subscriber);
-			}
-			unsafe fn unsubscribe_session_event_raw(&mut self, subscriber: *mut SessionEventSubscriber<$t>)
-			{
-				if let Some(index) = self.$v.iter().position(|&x| x == subscriber) { self.$v.remove(index); }
-			}
+			self.frame_navigated_event_subscriber.remove(index);
 		}
 	}
 }
-SessionEventSubscribable!(page::FrameNavigated => frame_navigated_event_subscriber);
 impl<W: Write, R: Read> Session<W, R>
 {
 	pub fn wait_message(&mut self) -> WebSocketResult<OwnedMessage>
@@ -159,7 +139,7 @@ impl<W: Write, R: Read> Session<W, R>
 	{
 		for &call in &self.frame_navigated_event_subscriber { unsafe { &mut *call }.on_event(e); }
 	}
-	pub fn wait_event<E: Event>(&mut self) -> GenericResult<E>
+	pub fn wait_event<E: Event + DeserializeOwned>(&mut self) -> GenericResult<E>
 	{
 		loop
 		{
@@ -173,11 +153,11 @@ impl<W: Write, R: Read> Session<W, R>
 				{
 					if name == page::FrameNavigated::METHOD_NAME
 					{
-						let e = page::FrameNavigated::deserialize(params);
-						self.dispatch_frame_navigated(&e);
+						let e: page::FrameNavigatedOwned = serde_json::from_value(params)?;
+						self.dispatch_frame_navigated(&e.borrow());
 						if name == E::METHOD_NAME { return Ok(unsafe { transmute_copy(&e) }); }
 					}
-					else if name == E::METHOD_NAME { return Ok(E::deserialize(params)); }
+					else if name == E::METHOD_NAME { return serde_json::from_value(params).map_err(From::from); }
 				}
 				_ => ()
 			}
@@ -197,8 +177,7 @@ impl<W: Write, R: Read> Session<W, R>
 				{
 					if name == page::FrameNavigated::METHOD_NAME
 					{
-						let e = page::FrameNavigated::deserialize(params);
-						for &call in &self.frame_navigated_event_subscriber { unsafe { &mut *call }.on_event(&e); }
+						self.dispatch_frame_navigated(&serde_json::from_value::<page::FrameNavigatedOwned>(params)?.borrow());
 					}
 				},
 				SessionReceiveEvent::Result { id: rid, result } => if rid == id { return Ok(result); },
@@ -219,13 +198,13 @@ impl<W: Write, R: Read> Session<W, R>
 pub mod dom
 {
 	use std::io::prelude::*;
-	use serde_json::{Value as JValue, Map as JMap};
+	use serde_json::{Value as JValue};
 
+	#[derive(Deserialize)]
 	pub struct DocumentUpdated;
 	impl super::Event for DocumentUpdated
 	{
 		const METHOD_NAME: &'static str = "DOM.documentUpdated";
-		fn deserialize(_: JMap<String, JValue>) -> Self { DocumentUpdated }
 	}
 
 	pub struct Node<'s, 'c: 's, W: Write + 'c, R: Read + 'c> { pub domain: &'s mut super::domain::DOM<'c, W, R>, pub id: isize }
@@ -260,50 +239,82 @@ pub mod dom
 #[allow(dead_code)]
 pub mod page
 {
-	use serde_json::{Value as JValue, Map as JMap};
-
+	#[derive(Deserialize, Clone, Copy)] #[serde(rename_all = "camelCase")]
 	pub struct LoadEventFired { timestamp: f64 }
 	impl super::Event for LoadEventFired
 	{
 		const METHOD_NAME: &'static str = "Page.loadEventFired";
-		fn deserialize(res: JMap<String, JValue>) -> Self
-		{
-			LoadEventFired { timestamp: res["timestamp"].as_f64().unwrap() }
-		}
 	}
-	pub struct FrameStoppedLoading { pub frame_id: String }
-	impl super::Event for FrameStoppedLoading
+	#[derive(Deserialize)] #[serde(rename_all = "camelCase")]
+	pub struct FrameStoppedLoading<'d> { pub frame_id: &'d str }
+	#[derive(Deserialize)] #[serde(rename_all = "camelCase")]
+	pub struct FrameStoppedLoadingOwned { pub frame_id: String }
+	impl<'d> super::Event for FrameStoppedLoading<'d>
 	{
 		const METHOD_NAME: &'static str = "Page.frameStoppedLoading";
-		fn deserialize(mut res: JMap<String, JValue>) -> Self
+	}
+	impl super::Event for FrameStoppedLoadingOwned { const METHOD_NAME: &'static str = "Page.frameStoppedLoading"; }
+	impl FrameStoppedLoadingOwned
+	{
+		pub fn borrow(&self) -> FrameStoppedLoading { FrameStoppedLoading { frame_id: &self.frame_id } }
+	}
+	impl<'d> FrameStoppedLoading<'d>
+	{
+		pub fn to_owned(&self) -> FrameStoppedLoadingOwned { FrameStoppedLoadingOwned { frame_id: self.frame_id.to_owned() } }
+	}
+	#[derive(Deserialize)] #[serde(rename_all = "camelCase")]
+	pub struct FrameNavigated<'d> { #[serde(borrow = "'d")] pub frame: Frame<'d> }
+	#[derive(Deserialize)] #[serde(rename_all = "camelCase")]
+	pub struct FrameNavigatedOwned { pub frame: FrameOwned }
+	impl<'d> super::Event for FrameNavigated<'d>  { const METHOD_NAME: &'static str = "Page.frameNavigated"; }
+	impl     super::Event for FrameNavigatedOwned { const METHOD_NAME: &'static str = "Page.frameNavigated"; }
+	impl FrameNavigatedOwned
+	{
+		pub fn borrow(&self) -> FrameNavigated { FrameNavigated { frame: self.frame.borrow() } }
+	}
+	impl<'d> FrameNavigated<'d>
+	{
+		pub fn to_owned(&self) -> FrameNavigatedOwned { FrameNavigatedOwned { frame: self.frame.to_owned() } }
+	}
+
+	#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)] #[serde(rename_all = "camelCase")]
+	pub struct FrameOwned
+	{
+		pub id: String, pub parent_id: Option<String>, pub loader_id: String,
+		pub name: Option<String>, pub url: String, pub security_origin: String,
+		pub mime_type: String
+	}
+	#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)] #[serde(rename_all = "camelCase")]
+	pub struct Frame<'d>
+	{
+		pub id: &'d str, pub parent_id: Option<&'d str>, pub loader_id: &'d str,
+		pub name: Option<&'d str>, pub url: &'d str, pub security_origin: &'d str,
+		pub mime_type: &'d str
+	}
+	impl<'d> Frame<'d>
+	{
+		pub fn to_owned(&self) -> FrameOwned
 		{
-			FrameStoppedLoading
+			FrameOwned
 			{
-				frame_id: match res.remove("frameId") { Some(JValue::String(s)) => s, _ => api_corruption!(value_type) }
+				id: self.id.to_owned(), parent_id: self.parent_id.as_ref().map(|&x| x.to_owned()),
+				loader_id: self.loader_id.to_owned(), name: self.name.as_ref().map(|&x| x.to_owned()),
+				url: self.url.to_owned(), security_origin: self.security_origin.to_owned(),
+				mime_type: self.mime_type.to_owned()
 			}
 		}
 	}
-	pub struct FrameNavigated { pub frame_id: String, pub name: Option<String>, pub url: String }
-	impl super::Event for FrameNavigated
+	impl FrameOwned
 	{
-		const METHOD_NAME: &'static str = "Page.frameNavigated";
-		fn deserialize(mut res: JMap<String, JValue>) -> Self
+		pub fn borrow(&self) -> Frame
 		{
-			match res.remove("frame")
+			Frame
 			{
-				Some(JValue::Object(mut f)) => FrameNavigated
-				{
-					frame_id: match f.remove("id") { Some(JValue::String(s)) => s, _ => api_corruption!(value_type) },
-					name: match f.remove("name") { Some(JValue::String(s)) => Some(s), None => None, _ => api_corruption!(value_type) },
-					url: match f.remove("url") { Some(JValue::String(s)) => s, _ => api_corruption!(value_type) }
-				},
-				_ => api_corruption!(value_type)
+				id: &self.id, parent_id: self.parent_id.as_ref().map(|x| x as &str),
+				loader_id: &self.loader_id, name: self.name.as_ref().map(|x| x as &str),
+				url: &self.url, security_origin: &self.security_origin, mime_type: &self.mime_type
 			}
 		}
-	}
-	impl Default for FrameNavigated
-	{
-		fn default() -> Self { FrameNavigated { frame_id: String::new(), name: None, url: String::new() } }
 	}
 }
 #[allow(dead_code)]
@@ -316,38 +327,23 @@ pub mod runtime
 {
 	use serde_json::{Value as JValue, Map as JMap};
 
-	pub struct ExecutionContextCreated { pub context_id: u64, pub name: String, pub aux: JValue }
+	#[derive(Deserialize, Clone)] #[serde(rename_all = "camelCase")]
+	pub struct ExecutionContextCreated { pub context: ExecutionContextDescription }
 	impl super::Event for ExecutionContextCreated
 	{
 		const METHOD_NAME: &'static str = "Runtime.executionContextCreated";
-		fn deserialize(mut res: JMap<String, JValue>) -> Self
-		{
-			match res.remove("context")
-			{
-				Some(JValue::Object(mut ctx)) => ExecutionContextCreated
-				{
-					context_id: ctx["id"].as_u64().unwrap(),
-					name: match ctx.remove("name") { Some(JValue::String(s)) => s, _ => api_corruption!(value_type) },
-					aux: ctx.remove("auxData").unwrap()
-				},
-				_ => api_corruption!(value_type)
-			}
-		}
 	}
-	pub struct ExecutionContextDestroyed { pub context_id: u64 }
+	#[derive(Deserialize, Clone, Copy)] #[serde(rename_all = "camelCase")]
+	pub struct ExecutionContextDestroyed { pub execution_context_id: ExecutionContextID }
 	impl super::Event for ExecutionContextDestroyed
 	{
 		const METHOD_NAME: &'static str = "Runtime.executionContextDestroyed";
-		fn deserialize(res: JMap<String, JValue>) -> Self
-		{
-			ExecutionContextDestroyed { context_id: res["executionContextId"].as_u64().unwrap() }
-		}
 	}
-	pub struct ExecutionContextsCleared;
+	#[derive(Deserialize)]
+	pub struct ExecutionContextsCleared {}
 	impl super::Event for ExecutionContextsCleared
 	{
 		const METHOD_NAME: &'static str = "Runtime.executionContextsCleared";
-		fn deserialize(_: JMap<String, JValue>) -> Self { ExecutionContextsCleared }
 	}
 
 	/// Unique script identifier
@@ -356,6 +352,8 @@ pub mod runtime
 	pub type RemoteObjectID = String;
 	/// Primitive value which cannot be JSON^stringified
 	pub type UnserializableValue = String;
+	/// ID ob an execution context
+	pub type ExecutionContextID = u64;
 	/// Mirror object referencing original JavaScript object.
 	#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)] #[serde(rename_all = "camelCase")]
 	pub struct RemoteObject
@@ -365,12 +363,25 @@ pub mod runtime
 		pub value: Option<JValue>, pub unserializable_value: Option<UnserializableValue>,
 		pub description: Option<String>, pub object_id: Option<RemoteObjectID>
 	}
+	/// Description of an isolated world
+	#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)] #[serde(rename_all = "camelCase")]
+	pub struct ExecutionContextDescription
+	{
+		/// Unique id of the execution context
+		pub id: ExecutionContextID,
+		/// Execution context origin
+		pub origin: String,
+		/// Human readable name describing given context
+		pub name: String,
+		/// Embedder-specific auxiliary data
+		pub aux_data: Option<JMap<String, JValue>>
+	}
 	#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)] #[serde(rename_all = "camelCase")]
 	pub struct ExceptionDetails
 	{
 		pub exception_id: u64, pub text: String, pub line_number: u64, pub column_number: u64,
 		pub script_id: Option<ScriptID>, pub url: Option<String>, pub stack_trace: Option<StackTrace>,
-		pub exception: Option<RemoteObject>, pub execution_context_id: Option<u64>
+		pub exception: Option<RemoteObject>, pub execution_context_id: Option<ExecutionContextID>
 	}
 	#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)] #[serde(rename_all = "camelCase")]
 	pub struct StackTrace
