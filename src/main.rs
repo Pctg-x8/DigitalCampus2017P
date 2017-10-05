@@ -124,19 +124,11 @@ fn main()
 	// 学生プロファイルと履修科目テーブル
 	let mut cdetails = intersysmenu.access_course_category().unwrap().access_details().unwrap();
 	let profile = cdetails.parse_profile().unwrap();
-	/*println!("=== 学生プロファイル ===");
-	println!("** 学籍番号: {}", profile.id);
-	println!("** 氏名: {}", profile.name);
-	println!("** 学部/学年: {} {}", profile.course, profile.grade);
-	println!("** セメスタ: {}", profile.semester);
-	println!("** 住所: {}", profile.address.join(" "))*/
 	println!("{}", serde_json::to_string(&profile).unwrap());
 	println!("{}", serde_json::to_string(&cdetails.parse_course_table().unwrap()).unwrap());
 	println!("{}", serde_json::to_string(&cdetails.parse_graduation_requirements_table().unwrap()).unwrap());
 
 	// 出席率を取りたい
-	/*let mut adetails = intersysmenu./*activate(cdetails.leave()).unwrap().*/jump_into_attendance_category().unwrap().isolate_mainframe_stealing_load().unwrap()
-		.jump_into_details().unwrap();*/
 	let mut adetails = cdetails.access_attendance_category().unwrap().access_details().unwrap();
 	println!("{}", serde_json::to_string(&adetails.parse_current_year_table().unwrap()).unwrap());
 	println!("{}", serde_json::to_string(&adetails.parse_attendance_rates().unwrap()).unwrap());

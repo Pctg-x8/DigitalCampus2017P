@@ -5,10 +5,13 @@ use headless_chrome::{SessionEventSubscriber, SessionEventSubscribable, Event, R
 use std::net::TcpStream;
 use serde_json;
 use serde_json::{Value as JValue, Map as JMap};
-use regex::{Regex, Captures};
+use regex::Regex;
 use std::marker::PhantomData;
 use std::mem::{replace, transmute_copy, transmute};
 use std::str::FromStr;
+
+use headless_chrome::runtime;
+use headless_chrome::runtime::JSONTyping;
 
 pub trait QueryValueType<T: Sized>: Sized { fn unwrap(self) -> T; }
 impl QueryValueType<JMap<String, JValue>> for JValue
@@ -20,17 +23,6 @@ impl QueryValueType<Vec<JValue>> for JValue
 	fn unwrap(self) -> Vec<JValue> { jvDecomposite!{ self => array[v]: v } }
 }
 impl QueryValueType<String> for JValue { fn unwrap(self) -> String { jvDecomposite!{ self => string[v]: v } } }
-
-/// JavaScriptクエリの結果("result"の中身)
-pub struct QueryResult(JMap<String, JValue>);
-impl QueryResult
-{
-	pub fn value(&self) -> &JValue { &self.0["value"] }
-	pub fn strip_value<T>(&mut self) -> T where JValue: QueryValueType<T>
-	{
-		self.0.remove("value").unwrap().unwrap()
-	}
-}
 
 pub struct RemoteCampus { session: headless_chrome::Session<TcpStream, TcpStream>, request_id: RequestID }
 impl RemoteCampus
@@ -56,51 +48,54 @@ impl RemoteCampus
 	pub fn query(&mut self, context: Option<u64>, expression: &str) -> GenericResult<()>
 	{
 		let id = self.new_request_id();
-		let mut q: JMap<_, _> = if let Some(cid) = context
+		let q = if let Some(cid) = context
 		{
-			self.session.runtime().evaluate_in_sync(id, cid, expression).map(QueryValueType::unwrap)?
+			self.session.runtime().evaluate_in_sync(id, cid, expression)?
 		}
 		else
 		{
-			self.session.runtime().evaluate_sync(id, expression).map(QueryValueType::unwrap)?
+			self.session.runtime().evaluate_sync(id, expression)?
 		};
-		let qres: JMap<_, _> = q.remove("result").unwrap().unwrap();
-		if qres.get("subtype").and_then(JValue::as_str) == Some("error")
+		if q.result.subtype == Some(headless_chrome::runtime::ObjectSubtype::Error)
 		{
 			// Error occured
-			panic!("Error in querying browser: {:?}", qres)
+			panic!("Error in querying browser: {:?}", q);
 		}
 		else { Ok(()) }
 	}
-	pub fn query_value(&mut self, context: Option<u64>, expression: &str) -> GenericResult<QueryResult>
+	pub fn query_value(&mut self, context: Option<u64>, expression: &str) -> GenericResult<headless_chrome::runtime::RemoteObject>
 	{
 		let id = self.new_request_id();
-		if let Some(cid) = context
+		let q = if let Some(cid) = context
 		{
-			self.session.runtime().evaluate_value_in_sync(id, cid, expression).map(QueryValueType::<JMap<_, _>>::unwrap)
-				.map(|mut r| QueryResult(r.remove("result").unwrap().unwrap()))
+			self.session.runtime().evaluate_value_in_sync(id, cid, expression)?
 		}
 		else
 		{
-			self.session.runtime().evaluate_value_sync(id, expression).map(QueryValueType::<JMap<_, _>>::unwrap)
-				.map(|mut r| QueryResult(r.remove("result").unwrap().unwrap()))
+			self.session.runtime().evaluate_value_sync(id, expression)?
+		};
+		if q.result.subtype == Some(headless_chrome::runtime::ObjectSubtype::Error)
+		{
+			// Error occured
+			panic!("Error in querying value to browser: {:?}", q);
 		}
+		else { Ok(q.result) }
 	}
 	pub fn query_page_location(&mut self) -> GenericResult<String>
 	{
-		self.query_value(None, "location.href").map(|mut v| v.strip_value())
+		self.query_value(None, "location.href").map(runtime::RemoteObject::assume_string)
 	}
 	pub fn query_page_location_in(&mut self, cid: u64) -> GenericResult<String>
 	{
-		self.query_value(Some(cid), "location.href").map(|mut v| v.strip_value())
+		self.query_value(Some(cid), "location.href").map(runtime::RemoteObject::assume_string)
 	}
 	pub fn is_in_login_page(&mut self) -> GenericResult<bool>
 	{
-		self.query_page_location().map(|l| l.contains("/campuslogin"))
+		Ok(self.query_page_location()?.contains("/campuslogin"))
 	}
 	pub fn is_in_home(&mut self) -> GenericResult<bool>
 	{
-		self.query_page_location().map(|l| l.contains("/campusHomepage"))
+		Ok(self.query_page_location()?.contains("/campusHomepage"))
 	}
 
 	pub fn click_element(&mut self, context: Option<u64>, selector: &str) -> GenericResult<&mut Self>
@@ -254,18 +249,18 @@ macro_rules! SessionEventLoop
 {
 	{ __SessionMatcher($name: expr, $params: expr) $($ee: ident)::+ => break } =>
 	{
-		if &$name == $($ee::)+METHOD_NAME { break; }
+		if $name == $($ee::)+METHOD_NAME { break; }
 	};
 	{ __SessionMatcher($name: expr, $params: expr) $($ee: ident)::+ => $x: expr } =>
 	{
-		if &$name == $($ee::)+METHOD_NAME
+		if $name == $($ee::)+METHOD_NAME
 		{
 			if ($x)($($ee::)+deserialize($params)).require_break() { break; }
 		}
 	};
 	{ __SessionMatcher($name: expr, $params: expr) $($ee: ident)::+ => break; $($rest: tt)* } =>
 	{
-		if &$name == $($ee::)+METHOD_NAME { break; }
+		if $name == $($ee::)+METHOD_NAME { break; }
 		else { SessionEventLoop!{ __SessionMatcher($name, $params) $($rest)* } }
 	};
 	{ __SessionMatcher($name: expr, $params: expr) $($ee: ident)::+ => $x: expr; $($rest: tt)* } =>
@@ -280,17 +275,16 @@ macro_rules! SessionEventLoop
 	{
 		loop
 		{
-			#[cfg(feature = "verbose")] let obj = $session.wait_rpc_return("SessionEventLoop")?;
-			#[cfg(not(feature = "verbose"))] let obj = $session.wait_rpc_return()?;
+			let s = $session.wait_text()?;
+			#[cfg(feature = "verbose")] println!("[SessionEventLoop]Received: {:?}", s);
+			let obj: headless_chrome::SessionReceiveEvent = ::serde_json::from_str(&s)?;
 			match obj
 			{
-				headless_chrome::SessionReceiveEvent::Method(name, params) =>
+				headless_chrome::SessionReceiveEvent::Method { method: name, params } =>
 				{
 					SessionEventLoop!{ __SessionMatcher(name, params) $($content)* }
 				},
-				headless_chrome::SessionReceiveEvent::Error { id, code, description } => return Err(
-					format!("RPC Error({}): {} in processing id {}", code, description, id).into()
-				),
+				e@headless_chrome::SessionReceiveEvent::Error { .. } => return Err(e.error_text().unwrap().into()),
 				_ => ()
 			}
 		}
@@ -512,20 +506,12 @@ impl CampusPlanCourseDetailsFrames
 	pub fn parse_profile(&mut self) -> GenericResult<StudentProfile>
 	{
 		let rctx = Some(self.main_frame_context());
-		let profile_rows_data = self.remote.query_value(rctx, 
-			r#"Array.prototype.map.call(document.querySelectorAll('#TableProfile tr:nth-child(2n) td:nth-child(2n)'), x => x.textContent.trim())"#)?;
-		let regex_replace_encoded = Regex::new(r"\\u\{([0-9a-fA-F]{4})\}").unwrap();
-		let mut profile_rows: Vec<_> = profile_rows_data.value().as_array().unwrap().iter()
-			.map(|v| regex_replace_encoded.replace_all(v.as_str().unwrap().trim(),
-				|cap: &Captures| String::from_utf16(&[u16::from_str_radix(&cap[1], 16).unwrap()]).unwrap()).into_owned()
-			).collect();
-
-		Ok(StudentProfile
-		{
-			id: profile_rows.remove(0), name: profile_rows.remove(0),
-			course: profile_rows.remove(0), grade: profile_rows.remove(0),
-			semester: profile_rows.remove(0), address: profile_rows
-		})
+		self.remote.query_value(rctx, r#"
+			var data = Array.prototype.map.call(document.querySelectorAll('#TableProfile tr:nth-child(2n) td:nth-child(2n)'), x => x.textContent.trim());
+			JSON.stringify({
+				id: data[0], name: data[1], course: data[2], grade: data[3], semester: data[4], address: data.slice(5, data.length)
+			})
+		"#).map_err(From::from).and_then(|s| serde_json::from_str(&s.assume_string()).map_err(From::from))
 	}
 	/// 履修テーブルの取得
 	/// ## †履修テーブルの仕組み†
@@ -555,7 +541,7 @@ impl CampusPlanCourseDetailsFrames
 				var title_link = k.querySelector('a');
 				if(!title_link) return null; else return title_link.textContent.trim();
 			})]
-		"#)?.strip_value();
+		"#)?.assume();
 		let course_table: Vec<Vec<_>> = values.into_iter().map(|v| QueryValueType::<Vec<_>>::unwrap(v).into_iter().map(|vs| match vs
 			{
 				serde_json::Value::Null => String::new(),
@@ -577,7 +563,7 @@ impl CampusPlanCourseDetailsFrames
 			var table = document.getElementById('dgrdSotsugyoYoken');
 			var rows = table.querySelectorAll('tr.text-main td:not(:first-child)');
 			Array.prototype.map.call(rows, x => x.textContent.trim())
-		"#)?.strip_value();
+		"#)?.assume();
 		let mut content = content_values.into_iter().map(|s| QueryValueType::<String>::unwrap(s).parse());
 
 		Ok(GraduationRequirements
@@ -654,7 +640,7 @@ impl CampusPlanAttendanceDetailsFrames
 			var table = document.getElementById({:?});
 			var rows = table.querySelectorAll("tr:not(:first-child) td");
 			Array.prototype.map.call(rows, x => x.textContent.trim())
-		"#, Self::TABLE_ID))?.strip_value();
+		"#, Self::TABLE_ID))?.assume();
 
 		/// 時限の数値変換(全角なのでparseで取れない)
 		fn parse_opening_time(s: &str) -> u32
@@ -717,7 +703,7 @@ impl CampusPlanAttendanceDetailsFrames
 				ret.push({{firstYear: parseInt(row[0]), startingPeriod: toPeriod(row[1]), rates: parseFloat(row[2].substring(row[2].search(/\d+(\.\d+)?/)))}});
 			}}
 			JSON.stringify(ret)
-		"#, Self::BY_PERIOD_TABLE_ID)).map(|mut x| serde_json::from_str(&x.strip_value::<String>()).unwrap())
+		"#, Self::BY_PERIOD_TABLE_ID)).map_err(From::from).and_then(|x| serde_json::from_str(&x.assume_string()).map_err(From::from))
 	}
 }
 /// 出欠テーブル: 科目行

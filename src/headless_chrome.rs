@@ -74,11 +74,25 @@ pub trait Event: Sized
 	fn assert_frame_navigated(self) -> page::FrameNavigated { panic!("Not a FrameNavigated"); }
 }
 
-pub enum SessionReceiveEvent
+#[derive(Deserialize)] #[serde(untagged)]
+pub enum SessionReceiveEvent<'s>
 {
-	Result(RequestID, JValue),
-	Error { id: RequestID, code: i64, description: String },
-	Method(String, JMap<String, JValue>), Other(JValue)
+	Result { id: RequestID, result: JValue },
+	Error { id: RequestID, error: ErrorDescription<'s> },
+	Method { method: &'s str, params: JMap<String, JValue> }
+}
+#[derive(Deserialize)]
+pub struct ErrorDescription<'s> { code: i64, message: &'s str }
+impl<'s> SessionReceiveEvent<'s>
+{
+	pub fn error_text(&self) -> Option<String>
+	{
+		if let &SessionReceiveEvent::Error { id, ref error } = self
+		{
+			Some(format!("RPC Error({}): {} in processing id {}", error.code, error.message, id))
+		}
+		else { None }
+	}
 }
 
 pub struct Session<W: Write, R: Read>
@@ -141,40 +155,6 @@ impl<W: Write, R: Read> Session<W, R>
 			}
 		}
 	}
-	#[cfg(feature = "verbose")]
-	pub fn wait_rpc_return(&mut self, verbose_scope: &str) -> GenericResult<JMap<String, JValue>>
-	{
-		let s = self.wait_text()?; println!("[{}]Received: {}", verbose_scope, s);
-		let obj = jvDecomposite!{ serde_json::from_str(&s)? => object[o]: o };
-		Ok(Self::parse_receive_value(obj))
-	}
-	#[cfg(not(feature = "verbose"))]
-	pub fn wait_rpc_return(&mut self) -> GenericResult<SessionReceiveEvent>
-	{
-		let s = self.wait_text()?;
-		let obj = jvDecomposite!{ serde_json::from_str(&s)? => object[o]: o };
-		Ok(Self::parse_receive_value(obj))
-	}
-	fn parse_receive_value(mut obj: JMap<String, JValue>) -> SessionReceiveEvent
-	{
-		if let Some(JValue::String(name)) = obj.remove("method")
-		{
-			SessionReceiveEvent::Method(name, match obj.remove("params") { Some(JValue::Object(o)) => o, _ => api_corruption!(value_type) })
-		}
-		else if let Some(JValue::Object(mut e)) = obj.remove("error")
-		{
-			SessionReceiveEvent::Error
-			{
-				id: obj["id"].as_u64().unwrap(), code: e["code"].as_i64().unwrap(),
-				description: match e.remove("message") { Some(JValue::String(s)) => s, _ => api_corruption!(value_type) }
-			}
-		}
-		else if let Some(r) = obj.remove("result")
-		{
-			SessionReceiveEvent::Result(obj["id"].as_u64().unwrap(), r)
-		}
-		else { api_corruption!(invalid_format) }
-	}
 	pub fn dispatch_frame_navigated(&self, e: &page::FrameNavigated)
 	{
 		for &call in &self.frame_navigated_event_subscriber { unsafe { &mut *call }.on_event(e); }
@@ -183,20 +163,21 @@ impl<W: Write, R: Read> Session<W, R>
 	{
 		loop
 		{
-			#[cfg(feature = "verbose")] let obj = self.wait_rpc_return("wait_event")?;
-			#[cfg(not(feature = "verbose"))] let obj = self.wait_rpc_return()?;
+			let s = self.wait_text()?;
+			#[cfg(feature = "verbose")] println!("[wait_event]Received: {:?}", s);
+			let obj: SessionReceiveEvent = serde_json::from_str(&s)?;
 			match obj
 			{
-				SessionReceiveEvent::Error { id, code, description } => return Err(format!("RPC Error({}): {} in processing id {}", code, description, id).into()),
-				SessionReceiveEvent::Method(name, params) =>
+				e@SessionReceiveEvent::Error { .. } => return Err(e.error_text().unwrap().into()),
+				SessionReceiveEvent::Method { method: name, params } =>
 				{
-					if &name == page::FrameNavigated::METHOD_NAME
+					if name == page::FrameNavigated::METHOD_NAME
 					{
 						let e = page::FrameNavigated::deserialize(params);
 						self.dispatch_frame_navigated(&e);
-						if &name == E::METHOD_NAME { return Ok(unsafe { transmute_copy(&e) }); }
+						if name == E::METHOD_NAME { return Ok(unsafe { transmute_copy(&e) }); }
 					}
-					else if &name == E::METHOD_NAME { return Ok(E::deserialize(params)); }
+					else if name == E::METHOD_NAME { return Ok(E::deserialize(params)); }
 				}
 				_ => ()
 			}
@@ -206,21 +187,21 @@ impl<W: Write, R: Read> Session<W, R>
 	{
 		loop
 		{
-			#[cfg(feature = "verbose")] let obj = self.wait_rpc_return("wait_result")?;
-			#[cfg(not(feature = "verbose"))] let obj = self.wait_rpc_return()?;
+			let s = self.wait_text()?;
+			#[cfg(feature = "verbose")] println!("[wait_result]Received: {:?}", s);
+			let obj: SessionReceiveEvent = serde_json::from_str(&s)?;
 			match obj
 			{
-				SessionReceiveEvent::Error { id, code, description } => return Err(format!("RPC Error({}): {} in processing id {}", code, description, id).into()),
-				SessionReceiveEvent::Method(name, params) =>
+				e@SessionReceiveEvent::Error { .. } => return Err(e.error_text().unwrap().into()),
+				SessionReceiveEvent::Method { method: name, params } =>
 				{
-					if &name == page::FrameNavigated::METHOD_NAME
+					if name == page::FrameNavigated::METHOD_NAME
 					{
 						let e = page::FrameNavigated::deserialize(params);
 						for &call in &self.frame_navigated_event_subscriber { unsafe { &mut *call }.on_event(&e); }
 					}
 				},
-				SessionReceiveEvent::Result(rid, p) => if rid == id { return Ok(p); },
-				_ => ()
+				SessionReceiveEvent::Result { id: rid, result } => if rid == id { return Ok(result); },
 			}
 		}
 	}
@@ -368,6 +349,74 @@ pub mod runtime
 		const METHOD_NAME: &'static str = "Runtime.executionContextsCleared";
 		fn deserialize(_: JMap<String, JValue>) -> Self { ExecutionContextsCleared }
 	}
+
+	/// Unique script identifier
+	pub type ScriptID = String;
+	/// Unique object identifier
+	pub type RemoteObjectID = String;
+	/// Primitive value which cannot be JSON^stringified
+	pub type UnserializableValue = String;
+	/// Mirror object referencing original JavaScript object.
+	#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)] #[serde(rename_all = "camelCase")]
+	pub struct RemoteObject
+	{
+		#[serde(rename = "type")] pub type_: ObjectType,
+		pub subtype: Option<ObjectSubtype>, pub class_name: Option<String>,
+		pub value: Option<JValue>, pub unserializable_value: Option<UnserializableValue>,
+		pub description: Option<String>, pub object_id: Option<RemoteObjectID>
+	}
+	#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)] #[serde(rename_all = "camelCase")]
+	pub struct ExceptionDetails
+	{
+		pub exception_id: u64, pub text: String, pub line_number: u64, pub column_number: u64,
+		pub script_id: Option<ScriptID>, pub url: Option<String>, pub stack_trace: Option<StackTrace>,
+		pub exception: Option<RemoteObject>, pub execution_context_id: Option<u64>
+	}
+	#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)] #[serde(rename_all = "camelCase")]
+	pub struct StackTrace
+	{
+		pub description: Option<String>, pub call_frames: Vec<CallFrame>, pub parent: Option<Box<StackTrace>>
+	}
+	#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)] #[serde(rename_all = "camelCase")]
+	pub struct CallFrame
+	{
+		pub function_name: String, pub script_id: ScriptID, pub url: String,
+		pub line_number: u64, pub column_number: u64
+	}
+
+	#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)] #[serde(rename_all = "camelCase")]
+	pub enum ObjectType { Object, Function, Undefined, String, Number, Boolean, Symbol }
+	#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)] #[serde(rename_all = "camelCase")]
+	pub enum ObjectSubtype
+	{
+		Array, Null, Node, Regexp, Date, Map, Set, Iterator, Generator, Error, Proxy, Promise, TypedArray
+	}
+	#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)] #[serde(rename_all = "camelCase")]
+	pub struct EvaluateResult { pub result: RemoteObject, pub exception_details: Option<ExceptionDetails> }
+
+	/// Typing Helpers
+	impl RemoteObject
+	{
+		pub fn strip_value(self) -> JValue { self.value.expect("Illegal use of API or API Corruption") }
+		pub fn assume_string(self) -> String
+		{
+			match self.value { Some(JValue::String(s)) => s, _ => api_corruption!(value_type) }
+		}
+		pub fn assume_object(self) -> JMap<String, JValue>
+		{
+			match self.value { Some(JValue::Object(s)) => s, _ => api_corruption!(value_type) }
+		}
+		pub fn assume_array(self) -> Vec<JValue>
+		{
+			match self.value { Some(JValue::Array(s)) => s, _ => api_corruption!(value_type) }
+		}
+	}
+	pub trait JSONTyping<T>
+	{
+		fn assume(self) -> T;
+	}
+	impl JSONTyping<String> for RemoteObject { fn assume(self) -> String { self.assume_string() } }
+	impl JSONTyping<Vec<JValue>> for RemoteObject { fn assume(self) -> Vec<JValue> { self.assume_array() } }
 }
 pub mod domain
 {
@@ -545,22 +594,26 @@ pub mod domain
 			self.0.send(&Payload { method: "Runtime.getProperties", id, params: Params { object_id } })
 		}
 
-		pub fn evaluate_sync(&mut self, id: RequestID, expression: &str) -> super::GenericResult<JValue>
+		pub fn evaluate_sync(&mut self, id: RequestID, expression: &str) -> super::GenericResult<super::runtime::EvaluateResult>
 		{
 			self.evaluate(id, expression).map_err(From::from).and_then(|_| self.0.wait_result(id))
+				.and_then(|x| ::serde_json::from_value(x).map_err(From::from))
 		}
 		#[allow(dead_code)]
-		pub fn evaluate_in_sync(&mut self, id: RequestID, context_id: u64, expression: &str) -> super::GenericResult<JValue>
+		pub fn evaluate_in_sync(&mut self, id: RequestID, context_id: u64, expression: &str) -> super::GenericResult<super::runtime::EvaluateResult>
 		{
 			self.evaluate_in(id, context_id, expression).map_err(From::from).and_then(|_| self.0.wait_result(id))
+				.and_then(|x| ::serde_json::from_value(x).map_err(From::from))
 		}
-		pub fn evaluate_value_sync(&mut self, id: RequestID, expression: &str) -> super::GenericResult<JValue>
+		pub fn evaluate_value_sync(&mut self, id: RequestID, expression: &str) -> super::GenericResult<super::runtime::EvaluateResult>
 		{
 			self.evaluate_value(id, expression).map_err(From::from).and_then(|_| self.0.wait_result(id))
+				.and_then(|x| ::serde_json::from_value(x).map_err(From::from))
 		}
-		pub fn evaluate_value_in_sync(&mut self, id: RequestID, context_id: u64, expression: &str) -> super::GenericResult<JValue>
+		pub fn evaluate_value_in_sync(&mut self, id: RequestID, context_id: u64, expression: &str) -> super::GenericResult<super::runtime::EvaluateResult>
 		{
 			self.evaluate_value_in(id, context_id, expression).map_err(From::from).and_then(|_| self.0.wait_result(id))
+				.and_then(|x| ::serde_json::from_value(x).map_err(From::from))
 		}
 		pub fn get_properties_sync(&mut self, id: RequestID, object_id: &str) -> super::GenericResult<JValue>
 		{
