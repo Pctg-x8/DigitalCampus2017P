@@ -13,8 +13,12 @@ use std::process::{Child, Command};
 use std::io::prelude::{Write, Read};
 use std::net::TcpStream;
 use std::io::{Result as IOResult, ErrorKind as IOErrorKind};
+use std::mem::transmute_copy;
 use serde_json::{Value as JValue, Map as JMap}; use serde_json;
 use GenericResult;
+
+// primitives
+pub type RequestID = u64;
 
 /// `json/version` response
 #[derive(Deserialize)]
@@ -66,6 +70,15 @@ pub trait Event: Sized
 {
 	const METHOD_NAME: &'static str;
 	fn deserialize(res: JMap<String, JValue>) -> Self;
+
+	fn assert_frame_navigated(self) -> page::FrameNavigated { panic!("Not a FrameNavigated"); }
+}
+
+pub enum SessionReceiveEvent
+{
+	Result(RequestID, JValue),
+	Error { id: RequestID, code: i64, description: String },
+	Method(String, JMap<String, JValue>), Other(JValue)
 }
 
 pub struct Session<W: Write, R: Read>
@@ -128,60 +141,87 @@ impl<W: Write, R: Read> Session<W, R>
 			}
 		}
 	}
+	#[cfg(feature = "verbose")]
+	pub fn wait_rpc_return(&mut self, verbose_scope: &str) -> GenericResult<JMap<String, JValue>>
+	{
+		let s = self.wait_text()?; println!("[{}]Received: {}", verbose_scope, s);
+		let obj = jvDecomposite!{ serde_json::from_str(&s)? => object[o]: o };
+		Ok(Self::parse_receive_value(obj))
+	}
+	#[cfg(not(feature = "verbose"))]
+	pub fn wait_rpc_return(&mut self) -> GenericResult<SessionReceiveEvent>
+	{
+		let s = self.wait_text()?;
+		let obj = jvDecomposite!{ serde_json::from_str(&s)? => object[o]: o };
+		Ok(Self::parse_receive_value(obj))
+	}
+	fn parse_receive_value(mut obj: JMap<String, JValue>) -> SessionReceiveEvent
+	{
+		if let Some(JValue::String(name)) = obj.remove("method")
+		{
+			SessionReceiveEvent::Method(name, match obj.remove("params") { Some(JValue::Object(o)) => o, _ => api_corruption!(value_type) })
+		}
+		else if let Some(JValue::Object(mut e)) = obj.remove("error")
+		{
+			SessionReceiveEvent::Error
+			{
+				id: obj["id"].as_u64().unwrap(), code: e["code"].as_i64().unwrap(),
+				description: match e.remove("message") { Some(JValue::String(s)) => s, _ => api_corruption!(value_type) }
+			}
+		}
+		else if let Some(r) = obj.remove("result")
+		{
+			SessionReceiveEvent::Result(obj["id"].as_u64().unwrap(), r)
+		}
+		else { api_corruption!(invalid_format) }
+	}
+	pub fn dispatch_frame_navigated(&self, e: &page::FrameNavigated)
+	{
+		for &call in &self.frame_navigated_event_subscriber { unsafe { &mut *call }.on_event(e); }
+	}
 	pub fn wait_event<E: Event>(&mut self) -> GenericResult<E>
 	{
 		loop
 		{
-			let s = self.wait_text()?;
-			#[cfg(feature = "verbose")] println!("[wait_event]Received: {}", s);
-			// let obj: HashMap<_, _> = ::json_flex::decode(s).unwrap();
-			let mut parsed: JValue = serde_json::from_str(&s).unwrap();
-			let obj = parsed.as_object_mut().unwrap();
-			if Some(E::METHOD_NAME) == obj.get("method").and_then(JValue::as_str)
+			#[cfg(feature = "verbose")] let obj = self.wait_rpc_return("wait_event")?;
+			#[cfg(not(feature = "verbose"))] let obj = self.wait_rpc_return()?;
+			match obj
 			{
-				return Ok(E::deserialize(match obj.remove("params")
+				SessionReceiveEvent::Error { id, code, description } => return Err(format!("RPC Error({}): {} in processing id {}", code, description, id).into()),
+				SessionReceiveEvent::Method(name, params) =>
 				{
-					Some(JValue::Object(o)) => o, _ => api_corruption!(value_type)
-				}));
-			}
-			if obj.contains_key("method") { self.handle_events(obj); }
-			if let Some(e) = obj.get("error")
-			{
-				return Err(From::from(format!("RPC Error({}): {} in processing id {}", e["code"].as_i64().unwrap(),
-					e["message"].as_str().unwrap(), obj["id"].as_u64().unwrap())));
+					if &name == page::FrameNavigated::METHOD_NAME
+					{
+						let e = page::FrameNavigated::deserialize(params);
+						self.dispatch_frame_navigated(&e);
+						if &name == E::METHOD_NAME { return Ok(unsafe { transmute_copy(&e) }); }
+					}
+					else if &name == E::METHOD_NAME { return Ok(E::deserialize(params)); }
+				}
+				_ => ()
 			}
 		}
 	}
-	pub fn wait_result(&mut self, id: usize) -> GenericResult<JValue>
+	pub fn wait_result(&mut self, id: RequestID) -> GenericResult<JValue>
 	{
 		loop
 		{
-			let s = self.wait_text()?;
-			#[cfg(feature = "verbose")] println!("[wait_result]Received: {}", s);
-			// let mut obj: HashMap<_, _> = ::json_flex::decode(s).unwrap();
-			let mut parser: JValue = ::serde_json::from_str(&s).unwrap();
-			let obj = parser.as_object_mut().unwrap();
-			if obj.contains_key("result")
+			#[cfg(feature = "verbose")] let obj = self.wait_rpc_return("wait_result")?;
+			#[cfg(not(feature = "verbose"))] let obj = self.wait_rpc_return()?;
+			match obj
 			{
-				if obj["id"].as_u64() == Some(id as u64) { return Ok(obj.remove("result").unwrap()); }
+				SessionReceiveEvent::Error { id, code, description } => return Err(format!("RPC Error({}): {} in processing id {}", code, description, id).into()),
+				SessionReceiveEvent::Method(name, params) =>
+				{
+					if &name == page::FrameNavigated::METHOD_NAME
+					{
+						let e = page::FrameNavigated::deserialize(params);
+						for &call in &self.frame_navigated_event_subscriber { unsafe { &mut *call }.on_event(&e); }
+					}
+				},
+				SessionReceiveEvent::Result(rid, p) => if rid == id { return Ok(p); },
+				_ => ()
 			}
-			if obj.contains_key("method") { self.handle_events(obj); }
-			if let Some(e) = obj.get("error")
-			{
-				return Err(From::from(format!("RPC Error({}): {} in processing id {}", e["code"].as_i64().unwrap(),
-					e["message"].as_str().unwrap(), obj["id"].as_u64().unwrap())));
-			}
-		}
-	}
-	fn handle_events(&mut self, obj: &mut JMap<String, JValue>)
-	{
-		if Some(page::FrameNavigated::METHOD_NAME) == obj.get("method").and_then(JValue::as_str)
-		{
-			let e = page::FrameNavigated::deserialize(match obj.remove("params")
-			{
-				Some(JValue::Object(o)) => o, _ => api_corruption!(value_type)
-			});
-			for &call in &self.frame_navigated_event_subscriber { unsafe { &mut *call }.on_event(&e); }
 		}
 	}
 	fn send_text(&mut self, text: String) -> WebSocketResult<()>
@@ -331,7 +371,7 @@ pub mod runtime
 }
 pub mod domain
 {
-	use super::Session;
+	use super::{Session, RequestID};
 	use std::io::prelude::*;
 	use websocket::WebSocketResult;
 	use serde_json::Value as JValue;
@@ -339,55 +379,55 @@ pub mod domain
 	pub struct DOM<'c, W: Write + 'c, R: Read + 'c>(pub &'c mut Session<W, R>);
 	impl<'c, W: Write + 'c, R: Read + 'c> DOM<'c, W, R>
 	{
-		pub fn enable(&mut self, id: usize) -> WebSocketResult<()>
+		pub fn enable(&mut self, id: RequestID) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload { method: &'static str, id: usize }
+			#[derive(Serialize)] struct Payload { method: &'static str, id: RequestID }
 			self.0.send(&Payload { method: "DOM.enable", id })
 		}
-		pub fn get_document(&mut self, id: usize) -> WebSocketResult<()>
+		pub fn get_document(&mut self, id: RequestID) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload { method: &'static str, id: usize }
+			#[derive(Serialize)] struct Payload { method: &'static str, id: RequestID }
 			self.0.send(&Payload { method: "DOM.getDocument", id })
 		}
-		pub fn query_selector(&mut self, id: usize, node_id: isize, selector: &str) -> WebSocketResult<()>
+		pub fn query_selector(&mut self, id: RequestID, node_id: isize, selector: &str) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: usize, params: Params<'s> }
+			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: RequestID, params: Params<'s> }
 			#[derive(Serialize)] #[serde(rename_all = "camelCase")] struct Params<'s> { node_id: isize, selector: &'s str }
 			self.0.send(&Payload { method: "DOM.querySelector", id, params: Params { node_id, selector } })
 		}
-		pub fn query_selector_all(&mut self, id: usize, node_id: isize, selector: &str) -> WebSocketResult<()>
+		pub fn query_selector_all(&mut self, id: RequestID, node_id: isize, selector: &str) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: usize, params: Params<'s> }
+			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: RequestID, params: Params<'s> }
 			#[derive(Serialize)] #[serde(rename_all = "camelCase")] struct Params<'s> { node_id: isize, selector: &'s str }
 			self.0.send(&Payload { method: "DOM.querySelectorAll", id, params: Params { node_id, selector } })
 		}
-		pub fn focus(&mut self, id: usize, node_id: isize) -> WebSocketResult<()>
+		pub fn focus(&mut self, id: RequestID, node_id: isize) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload { method: &'static str, id: usize, params: Params }
+			#[derive(Serialize)] struct Payload { method: &'static str, id: RequestID, params: Params }
 			#[derive(Serialize)] #[serde(rename_all = "camelCase")] struct Params { node_id: isize }
 			self.0.send(&Payload { method: "DOM.focus", id, params: Params { node_id } })
 		}
-		pub fn get_attributes(&mut self, id: usize, node_id: isize) -> WebSocketResult<()>
+		pub fn get_attributes(&mut self, id: RequestID, node_id: isize) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload { method: &'static str, id: usize, params: Params }
+			#[derive(Serialize)] struct Payload { method: &'static str, id: RequestID, params: Params }
 			#[derive(Serialize)] #[serde(rename_all = "camelCase")] struct Params { node_id: isize }
 			self.0.send(&Payload { method: "DOM.getAttributes", id, params: Params { node_id } })
 		}
 
-		pub fn get_document_sync(&mut self, id: usize) -> super::GenericResult<JValue>
+		pub fn get_document_sync(&mut self, id: RequestID) -> super::GenericResult<JValue>
 		{
 			self.get_document(id).map_err(From::from).and_then(|_| self.0.wait_result(id))
 		}
-		pub fn get_root_node_sync<'s>(&'s mut self, id: usize) -> super::GenericResult<super::dom::Node<'s, 'c, W, R>>
+		pub fn get_root_node_sync<'s>(&'s mut self, id: RequestID) -> super::GenericResult<super::dom::Node<'s, 'c, W, R>>
 		{
 			self.get_document_sync(id).map(move |id| super::dom::Node { domain: self, id: id["root"]["nodeId"].as_i64().unwrap() as isize })
 		}
-		pub fn query_selector_sync(&mut self, id: usize, node_id: isize, selector: &str) -> super::GenericResult<isize>
+		pub fn query_selector_sync(&mut self, id: RequestID, node_id: isize, selector: &str) -> super::GenericResult<isize>
 		{
 			self.query_selector(id, node_id, selector).map_err(From::from).and_then(|_| self.0.wait_result(id))
 				.map(|o| o["nodeId"].as_i64().unwrap() as isize)
 		}
-		pub fn query_selector_all_sync(&mut self, id: usize, node_id: isize, selector: &str) -> super::GenericResult<Vec<JValue>>
+		pub fn query_selector_all_sync(&mut self, id: RequestID, node_id: isize, selector: &str) -> super::GenericResult<Vec<JValue>>
 		{
 			self.query_selector_all(id, node_id, selector).map_err(From::from).and_then(|_| self.0.wait_result(id)).map(|o| match o
 			{
@@ -399,11 +439,11 @@ pub mod domain
 				_ => api_corruption!(value_type)
 			})
 		}
-		pub fn focus_sync(&mut self, id: usize, node_id: isize) -> super::GenericResult<()>
+		pub fn focus_sync(&mut self, id: RequestID, node_id: isize) -> super::GenericResult<()>
 		{
 			self.focus(id, node_id).map_err(From::from).and_then(|_| self.0.wait_result(id)).map(|_| ())
 		}
-		pub fn get_attributes_sync(&mut self, id: usize, node_id: isize) -> super::GenericResult<JValue>
+		pub fn get_attributes_sync(&mut self, id: RequestID, node_id: isize) -> super::GenericResult<JValue>
 		{
 			self.get_attributes(id, node_id).map_err(From::from).and_then(|_| self.0.wait_result(id))
 		}
@@ -416,14 +456,14 @@ pub mod domain
 	pub struct Input<'c, W: Write + 'c, R: Read + 'c>(pub &'c mut Session<W, R>);
 	impl<'c, W: Write + 'c, R: Read + 'c> Input<'c, W, R>
 	{
-		pub fn dispatch_key_event(&mut self, id: usize, etype: super::input::KeyEvent, text: Option<&str>) -> WebSocketResult<()>
+		pub fn dispatch_key_event(&mut self, id: RequestID, etype: super::input::KeyEvent, text: Option<&str>) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: usize, params: Params<'s> }
+			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: RequestID, params: Params<'s> }
 			#[derive(Serialize)] struct Params<'s> { #[serde(rename = "type")] etype: super::input::KeyEvent, text: Option<&'s str> }
 			self.0.send(&Payload { method: "Input.dispatchKeyEvent", id, params: Params { etype, text } })
 		}
 
-		pub fn dispatch_key_event_sync(&mut self, id: usize, etype: super::input::KeyEvent, text: Option<&str>) -> super::GenericResult<()>
+		pub fn dispatch_key_event_sync(&mut self, id: RequestID, etype: super::input::KeyEvent, text: Option<&str>) -> super::GenericResult<()>
 		{
 			self.dispatch_key_event(id, etype, text).map_err(From::from).and_then(|_| self.0.wait_result(id)).map(|_| ())
 		}
@@ -431,41 +471,41 @@ pub mod domain
 	pub struct Page<'c, W: Write + 'c, R: Read + 'c>(pub &'c mut Session<W, R>);
 	impl<'c, W: Write + 'c, R: Read + 'c> Page<'c, W, R>
 	{
-		pub fn enable(&mut self, id: usize) -> WebSocketResult<()>
+		pub fn enable(&mut self, id: RequestID) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload { method: &'static str, id: usize }
+			#[derive(Serialize)] struct Payload { method: &'static str, id: RequestID }
 			self.0.send(&Payload { method: "Page.enable", id })
 		}
-		pub fn navigate(&mut self, id: usize, url: &str) -> WebSocketResult<()>
+		pub fn navigate(&mut self, id: RequestID, url: &str) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: usize, params: Params<'s> }
+			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: RequestID, params: Params<'s> }
 			#[derive(Serialize)] struct Params<'s> { url: &'s str }
 			self.0.send(&Payload { method: "Page.navigate", id, params: Params { url } })
 		}
-		pub fn get_resource_tree(&mut self, id: usize) -> WebSocketResult<()>
+		pub fn get_resource_tree(&mut self, id: RequestID) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload { method: &'static str, id: usize }
+			#[derive(Serialize)] struct Payload { method: &'static str, id: RequestID }
 			self.0.send(&Payload { method: "Page.getResourceTree", id })
 		}
 		/// Experimental(stable版Chromeだと返り値がない)
 		#[allow(dead_code)]
-		pub fn create_isolated_world(&mut self, id: usize, frame_id: &str) -> WebSocketResult<()>
+		pub fn create_isolated_world(&mut self, id: RequestID, frame_id: &str) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: usize, params: Params<'s> }
+			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: RequestID, params: Params<'s> }
 			#[derive(Serialize)] #[serde(rename_all = "camelCase")] struct Params<'s> { frame_id: &'s str }
 			self.0.send(&Payload { method: "Page.createIsolatedWorld", id, params: Params { frame_id } })
 		}
 
-		pub fn navigate_sync(&mut self, id: usize, url: &str) -> super::GenericResult<()>
+		pub fn navigate_sync(&mut self, id: RequestID, url: &str) -> super::GenericResult<()>
 		{
 			self.navigate(id, url).map_err(From::from).and_then(|_| self.0.wait_result(id)).map(|_| ())
 		}
-		pub fn get_resource_tree_sync(&mut self, id: usize) -> super::GenericResult<JValue>
+		pub fn get_resource_tree_sync(&mut self, id: RequestID) -> super::GenericResult<JValue>
 		{
 			self.get_resource_tree(id).map_err(From::from).and_then(|_| self.0.wait_result(id))
 		}
 		#[allow(dead_code)]
-		pub fn create_isolated_world_sync(&mut self, id: usize, frame_id: &str) -> super::GenericResult<i64>
+		pub fn create_isolated_world_sync(&mut self, id: RequestID, frame_id: &str) -> super::GenericResult<i64>
 		{
 			self.create_isolated_world(id, frame_id).map_err(From::from).and_then(|_| self.0.wait_result(id)).map(|v| v.as_i64().unwrap())
 		}
@@ -473,56 +513,56 @@ pub mod domain
 	pub struct Runtime<'c, W: Write + 'c, R: Read + 'c>(pub &'c mut Session<W, R>);
 	impl<'c, W: Write + 'c, R: Read + 'c> Runtime<'c, W, R>
 	{
-		pub fn evaluate(&mut self, id: usize, expression: &str) -> WebSocketResult<()>
+		pub fn evaluate(&mut self, id: RequestID, expression: &str) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: usize, params: Params<'s> }
+			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: RequestID, params: Params<'s> }
 			#[derive(Serialize)] struct Params<'s> { expression: &'s str }
 			self.0.send(&Payload { method: "Runtime.evaluate", id, params: Params { expression } })
 		}
 		#[allow(dead_code)]
-		pub fn evaluate_in(&mut self, id: usize, context_id: u64, expression: &str) -> WebSocketResult<()>
+		pub fn evaluate_in(&mut self, id: RequestID, context_id: u64, expression: &str) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: usize, params: Params<'s> }
+			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: RequestID, params: Params<'s> }
 			#[derive(Serialize)] #[serde(rename_all = "camelCase")] struct Params<'s> { expression: &'s str, context_id: u64 }
 			self.0.send(&Payload { method: "Runtime.evaluate", id, params: Params { expression, context_id } })
 		}
-		pub fn evaluate_value(&mut self, id: usize, expression: &str) -> WebSocketResult<()>
+		pub fn evaluate_value(&mut self, id: RequestID, expression: &str) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: usize, params: Params<'s> }
+			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: RequestID, params: Params<'s> }
 			#[derive(Serialize)] #[serde(rename_all = "camelCase")] struct Params<'s> { expression: &'s str, return_by_value: bool }
 			self.0.send(&Payload { method: "Runtime.evaluate", id, params: Params { expression, return_by_value: true } })
 		}
-		pub fn evaluate_value_in(&mut self, id: usize, context_id: u64, expression: &str) -> WebSocketResult<()>
+		pub fn evaluate_value_in(&mut self, id: RequestID, context_id: u64, expression: &str) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: usize, params: Params<'s> }
+			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: RequestID, params: Params<'s> }
 			#[derive(Serialize)] #[serde(rename_all = "camelCase")] struct Params<'s> { expression: &'s str, return_by_value: bool, context_id: u64 }
 			self.0.send(&Payload { method: "Runtime.evaluate", id, params: Params { expression, return_by_value: true, context_id } })
 		}
-		pub fn get_properties(&mut self, id: usize, object_id: &str) -> WebSocketResult<()>
+		pub fn get_properties(&mut self, id: RequestID, object_id: &str) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: usize, params: Params<'s> }
+			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: RequestID, params: Params<'s> }
 			#[derive(Serialize)] #[serde(rename_all = "camelCase")] struct Params<'s> { object_id: &'s str }
 			self.0.send(&Payload { method: "Runtime.getProperties", id, params: Params { object_id } })
 		}
 
-		pub fn evaluate_sync(&mut self, id: usize, expression: &str) -> super::GenericResult<JValue>
+		pub fn evaluate_sync(&mut self, id: RequestID, expression: &str) -> super::GenericResult<JValue>
 		{
 			self.evaluate(id, expression).map_err(From::from).and_then(|_| self.0.wait_result(id))
 		}
 		#[allow(dead_code)]
-		pub fn evaluate_in_sync(&mut self, id: usize, context_id: u64, expression: &str) -> super::GenericResult<JValue>
+		pub fn evaluate_in_sync(&mut self, id: RequestID, context_id: u64, expression: &str) -> super::GenericResult<JValue>
 		{
 			self.evaluate_in(id, context_id, expression).map_err(From::from).and_then(|_| self.0.wait_result(id))
 		}
-		pub fn evaluate_value_sync(&mut self, id: usize, expression: &str) -> super::GenericResult<JValue>
+		pub fn evaluate_value_sync(&mut self, id: RequestID, expression: &str) -> super::GenericResult<JValue>
 		{
 			self.evaluate_value(id, expression).map_err(From::from).and_then(|_| self.0.wait_result(id))
 		}
-		pub fn evaluate_value_in_sync(&mut self, id: usize, context_id: u64, expression: &str) -> super::GenericResult<JValue>
+		pub fn evaluate_value_in_sync(&mut self, id: RequestID, context_id: u64, expression: &str) -> super::GenericResult<JValue>
 		{
 			self.evaluate_value_in(id, context_id, expression).map_err(From::from).and_then(|_| self.0.wait_result(id))
 		}
-		pub fn get_properties_sync(&mut self, id: usize, object_id: &str) -> super::GenericResult<JValue>
+		pub fn get_properties_sync(&mut self, id: RequestID, object_id: &str) -> super::GenericResult<JValue>
 		{
 			self.get_properties(id, object_id).map_err(From::from).and_then(|_| self.0.wait_result(id))
 		}
@@ -533,15 +573,15 @@ pub mod domain
 	{
 		/// Enables reporting of execution contexts creation by means of `executionContextCreated` event.
 		/// When the reporting gets enabled the event will be sent immediately for each existing execution context.
-		pub fn enable(&mut self, id: usize) -> WebSocketResult<()>
+		pub fn enable(&mut self, id: RequestID) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload { method: &'static str, id: usize }
+			#[derive(Serialize)] struct Payload { method: &'static str, id: RequestID }
 			self.0.send(&Payload { method: "Runtime.enable", id })
 		}
 		/// Disables reporting of execution contexts creation
-		pub fn disable(&mut self, id: usize) -> WebSocketResult<()>
+		pub fn disable(&mut self, id: RequestID) -> WebSocketResult<()>
 		{
-			#[derive(Serialize)] struct Payload { method: &'static str, id: usize }
+			#[derive(Serialize)] struct Payload { method: &'static str, id: RequestID }
 			self.0.send(&Payload { method: "Runtime.disable", id })
 		}
 	}
