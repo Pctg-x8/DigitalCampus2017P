@@ -1,17 +1,17 @@
 //! DigitalCampus Remote Controllers
 
+#![allow(dead_code)]
+
 use {headless_chrome, GenericResult};
 use headless_chrome::{SessionEventSubscriber, SessionEventSubscribable, Event, RequestID};
 use std::net::TcpStream;
 use serde_json;
 use serde_json::{Value as JValue, Map as JMap};
-use regex::Regex;
 use std::marker::PhantomData;
-use std::mem::{replace, transmute_copy, transmute};
-use std::str::FromStr;
+use std::mem::{replace, transmute};
 
 use headless_chrome::runtime;
-use headless_chrome::runtime::JSONTyping;
+// use headless_chrome::runtime::JSONTyping;
 
 pub trait QueryValueType<T: Sized>: Sized { fn unwrap(self) -> T; }
 impl QueryValueType<JMap<String, JValue>> for JValue
@@ -511,7 +511,7 @@ impl CampusPlanCourseDetailsFrames
 			JSON.stringify({
 				id: data[0], name: data[1], course: data[2], grade: data[3], semester: data[4], address: data.slice(5, data.length)
 			})
-		"#).map_err(From::from).and_then(|s| serde_json::from_str(&s.assume_string()).map_err(From::from))
+		"#).and_then(|s| serde_json::from_str(&s.assume_string()).map_err(From::from))
 	}
 	/// 履修テーブルの取得
 	/// ## †履修テーブルの仕組み†
@@ -525,57 +525,66 @@ impl CampusPlanCourseDetailsFrames
 	///     - これのおかげで若干空きセルに立体感が出る（？
 	pub fn parse_course_table(&mut self) -> GenericResult<CourseTable>
 	{
-		// 下のスクリプトで得られるデータは行優先です(0~5が1限、6~11が2限といった感じ)
 		let rctx = Some(self.main_frame_context());
-		let values: Vec<_> = self.remote.query_value(rctx, r#"
+		self.remote.query_value(rctx, r#"
 			var tables = document.querySelectorAll('table.rishu-tbl-cell');
 			// 前半クォーターは3、後半クォーターは5
 			var q1_koma_cells = tables[3].querySelectorAll('td.rishu-tbl-cell');
 			var q2_koma_cells = tables[5].querySelectorAll('td.rishu-tbl-cell');
-			[Array.prototype.map.call(q1_koma_cells, function(k)
+			var first_koma_cells = Array.prototype.map.call(q1_koma_cells, function(k)
 			{
 				var title_link = k.querySelector('a');
 				if(!title_link) return null; else return title_link.textContent.trim();
-			}), Array.prototype.map.call(q2_koma_cells, function(k)
+			});
+			var last_koma_cells = Array.prototype.map.call(q2_koma_cells, function(k)
 			{
 				var title_link = k.querySelector('a');
 				if(!title_link) return null; else return title_link.textContent.trim();
-			})]
-		"#)?.assume();
-		let course_table: Vec<Vec<_>> = values.into_iter().map(|v| QueryValueType::<Vec<_>>::unwrap(v).into_iter().map(|vs| match vs
+			});
+			var first_quarter = [], last_quarter = [];
+			for(var i = 0; i < first_koma_cells.length; i += 6)
 			{
-				serde_json::Value::Null => String::new(),
-				serde_json::Value::String(s) => s,
-				_ => api_corruption!(value_type)
-			}).collect()).collect();
-
-		Ok(CourseTable
-		{
-			first_quarter: course_table[0].chunks(6).map(ToOwned::to_owned).collect(),
-			last_quarter: course_table[1].chunks(6).map(ToOwned::to_owned).collect()
-		})
+				first_quarter.push({
+					monday: first_koma_cells[i + 0], tuesday: first_koma_cells[i + 1], wednesday: first_koma_cells[i + 2],
+					thursday: first_koma_cells[i + 3], friday: first_koma_cells[i + 4], saturday: first_koma_cells[i + 5]
+				});
+				last_quarter.push({
+					monday: last_koma_cells[i + 0], tuesday: last_koma_cells[i + 1], wednesday: last_koma_cells[i + 2],
+					thursday: last_koma_cells[i + 3], friday: last_koma_cells[i + 4], saturday: last_koma_cells[i + 5]
+				});
+			}
+			JSON.stringify({ firstQuarter: first_quarter, lastQuarter: last_quarter })
+		"#).and_then(|s| serde_json::from_str(&s.assume_string()).map_err(From::from))
 	}
 	/// 卒業要件集計欄のデータを取得
 	pub fn parse_graduation_requirements_table(&mut self) -> GenericResult<GraduationRequirements>
 	{
 		let rctx = Some(self.main_frame_context());
-		let content_values: Vec<_> = self.remote.query_value(rctx, r#"
+		self.remote.query_value(rctx, r#"
 			var table = document.getElementById('dgrdSotsugyoYoken');
-			var rows = table.querySelectorAll('tr.text-main td:not(:first-child)');
-			Array.prototype.map.call(rows, x => x.textContent.trim())
-		"#)?.assume();
-		let mut content = content_values.into_iter().map(|s| QueryValueType::<String>::unwrap(s).parse());
-
-		Ok(GraduationRequirements
-		{
-			requirements: From::from(content.by_ref().take(8).collect::<Result<Vec<u16>, _>>()?),
-			mastered: From::from(content.by_ref().skip(1).take(9).collect::<Result<Vec<u16>, _>>()?),
-			current: From::from(content.by_ref().take(9).collect::<Result<Vec<u16>, _>>()?)
-		})
+			var cells = Array.prototype.map.call(table.querySelectorAll('tr.text-main td:not(:first-child)'), x => x.textContent.trim());
+			JSON.stringify({
+				requirements: {
+					intercom: parseInt(cells[0]), selfdev:  parseInt(cells[1]), general:  parseInt(cells[2]),
+					basic:    parseInt(cells[3]), practice: parseInt(cells[4]), research: parseInt(cells[5]),
+					totalRequired: parseInt(cells[6]), totalSelected: parseInt(cells[7]), total: 0
+				},
+				mastered: {
+					intercom: parseInt(cells[9 + 0]), selfdev:  parseInt(cells[9 + 1]), general:  parseInt(cells[9 + 2]),
+					basic:    parseInt(cells[9 + 3]), practice: parseInt(cells[9 + 4]), research: parseInt(cells[9 + 5]),
+					totalRequired: parseInt(cells[9 + 6]), totalSelected: parseInt(cells[9 + 7]), total: parseInt(cells[9 + 8])
+				},
+				current: {
+					intercom: parseInt(cells[18 + 0]), selfdev:  parseInt(cells[18 + 1]), general:  parseInt(cells[18 + 2]),
+					basic:    parseInt(cells[18 + 3]), practice: parseInt(cells[18 + 4]), research: parseInt(cells[18 + 5]),
+					totalRequired: parseInt(cells[18 + 6]), totalSelected: parseInt(cells[18 + 7]), total: parseInt(cells[18 + 8])
+				}
+			})
+		"#).and_then(|x| serde_json::from_str(&x.assume_string()).map_err(From::from))
 	}
 }
 /// 学生プロファイル
-#[derive(Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
+#[derive(Serialize, Deserialize, Debug, Clone)] #[serde(rename_all = "camelCase")]
 pub struct StudentProfile
 {
 	#[doc = "学籍番号"] pub id: String,
@@ -586,14 +595,21 @@ pub struct StudentProfile
 	#[doc = "住所"] pub address: Vec<String>
 }
 /// 履修科目テーブル
-#[derive(Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
+#[derive(Serialize, Deserialize, Debug, Clone)] #[serde(rename_all = "camelCase")]
 pub struct CourseTable
 {
-	#[doc = "前半クォーター"] pub first_quarter: Vec<Vec<String>>,
-	#[doc = "後半クォーター"]  pub last_quarter: Vec<Vec<String>>
+	#[doc = "前半クォーター"] pub first_quarter: Vec<WeeklyCourse>,
+	#[doc = "後半クォーター"]  pub last_quarter: Vec<WeeklyCourse>
+}
+/// 履修科目 曜日別
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WeeklyCourse
+{
+	pub monday: Option<String>, pub tuesday: Option<String>, pub wednesday: Option<String>,
+	pub thursday: Option<String>, pub friday: Option<String>, pub saturday: Option<String>
 }
 /// 卒業要件集計テーブル
-#[derive(Serialize, Deserialize)] #[serde(rename_all = "camelCase")] #[repr(C)]
+#[derive(Serialize, Deserialize, Debug, Clone)] #[serde(rename_all = "camelCase")] #[repr(C)]
 pub struct GraduationRequirements
 {
 	#[doc = "必要単位数"] pub requirements: CategorizedUnits,
@@ -601,7 +617,7 @@ pub struct GraduationRequirements
 	#[doc = "履修中単位"] pub current: CategorizedUnits
 }
 /// 講義カテゴリ別単位数
-#[derive(Serialize, Deserialize)] #[serde(rename_all = "camelCase")] #[repr(C)]
+#[derive(Serialize, Deserialize, Debug, Clone)] #[serde(rename_all = "camelCase")] #[repr(C)]
 pub struct CategorizedUnits
 {
 	#[doc = "国際コミュニケーション"] pub intercom: u16,
@@ -616,14 +632,6 @@ pub struct CategorizedUnits
 	#[doc = "選択小計"] pub total_selected: u16,
 	#[doc = "総計"] pub total: u16
 }
-impl From<Vec<u16>> for CategorizedUnits
-{
-	fn from(mut v: Vec<u16>) -> CategorizedUnits
-	{
-		if v.len() < 9 { v.resize(9, 0); }
-		unsafe { transmute_copy(&*(v.as_ptr() as *const [u16; 9])) }
-	}
-}
 
 /// 出欠状況参照ページ
 pub enum AttendanceDetailsPage { }
@@ -631,70 +639,62 @@ impl CampusPlanAttendanceDetailsFrames
 {
 	const TABLE_ID: &'static str = "dg";
 	const BY_PERIOD_TABLE_ID: &'static str = "dgKikanbetsu";
+	const COMMONCODE: &'static str = r#"function toPeriod(s) {
+		switch(s) {
+		case "1 Q": return "FirstQuarter"; case "2 Q": return "SecondQuarter";
+		case "3 Q": return "ThirdQuarter";  case "4 Q": return "FourthQuarter";
+		case "前期": return "FirstStage"; case "後期": return "LateStage";
+		case "通年": return "WholeYear"; default: console.assert(false);
+		}
+	}"#;
 	
 	/// 今年度の出欠状況テーブルを取得
 	pub fn parse_current_year_table(&mut self) -> GenericResult<Vec<SubjectAttendanceState>>
 	{
 		let rctx = Some(self.main_frame_context());
-		let mut res_values: Vec<_> = self.remote.query_value(rctx, &format!(r#"
+		self.remote.query_value(rctx, &format!(r#"
+			{}
+			function toWeekName(s)
+			{{
+				switch(s)
+				{{
+				case "月曜日": return "Monday"; case "火曜日": return "Tuesday"; case "水曜日": return "Wednesday";
+				case "木曜日": return "Thursday"; case "金曜日": return "Friday"; case "土曜日": return "Saturday";
+				default: console.assert(false);
+				}}
+			}}
+
 			var table = document.getElementById({:?});
-			var rows = table.querySelectorAll("tr:not(:first-child) td");
-			Array.prototype.map.call(rows, x => x.textContent.trim())
-		"#, Self::TABLE_ID))?.assume();
-
-		/// 時限の数値変換(全角なのでparseで取れない)
-		fn parse_opening_time(s: &str) -> u32
-		{
-			     if s == "１" { 1 } else if s == "２" { 2 } else if s == "３" { 3 }
-			else if s == "４" { 4 } else if s == "５" { 5 } else if s == "６" { 6 }
-			else if s == "７" { 7 } else if s == "８" { 8 } else { 0 }
-		}
-
-		let re_nums = Regex::new(r"\d+").unwrap();
-		let re_floatings = Regex::new(r"\d+(.\d)?").unwrap();
-		let re_date = Regex::new(r"(\d+)/(\d+)").unwrap();
-		let mut subjects = Vec::new();
-		while !res_values.is_empty()
-		{
-			subjects.push(SubjectAttendanceState
-			{
-				code: res_values.remove(0).as_str().unwrap().to_owned(),
-				name: res_values.remove(0).as_str().unwrap().to_owned(),
-				period: Period::from_str(res_values.remove(0).as_str().unwrap()).unwrap(),
-				week: Week::from_str(res_values.remove(0).as_str().unwrap()).unwrap(),
-				time: parse_opening_time(re_nums.find(res_values.remove(0).as_str().unwrap()).unwrap().as_str()),
-				rate: re_floatings.find(res_values.remove(0).as_str().unwrap()).unwrap().as_str().parse().unwrap(),
-				attendance_cells: res_values.drain(..15).map(|s|
-				{
-					let s = s.as_str().unwrap();
-					if s.is_empty() { (0, 0, DayAttendanceState::NoData) }
-					else
-					{
-						let date = re_date.captures(s).unwrap();
-						let (m, d) = (date[1].parse().unwrap(), date[2].parse().unwrap());
-						(m, d, if s.contains("公認欠席") { DayAttendanceState::Authorized }
-						else if s.contains("出席") { DayAttendanceState::Presence }
-						else if s.contains("欠席") { DayAttendanceState::Absence }
-						else { DayAttendanceState::NoData })
-					}
-				}).collect()
-			})
-		}
-		Ok(subjects)
+			var cells = Array.prototype.map.call(table.querySelectorAll("tr:not(:first-child) td"), x => x.textContent.trim());
+			var subjects = [];
+			for(var i = 0; i < cells.length; i += 15 + 6)
+			{{
+				subjects.push({{
+					code: cells[i + 0], name: cells[i + 1], period: toPeriod(cells[i + 2]), week: toWeekName(cells[i + 3]),
+					// 半角にしてからparseInt
+					time: parseInt(cells[i + 4].substring(cells[i + 4].search(/\d+/)).replace(/[０-ｚ]/g,
+						x => String.fromCharCode(x.charCodeAt(0) - 65248))),
+					rate: parseFloat(cells[i + 5].substring(cells[i + 5].search(/\d+(\.\d+)?/))),
+					attendanceCells: cells.slice(i + 6, i + 6 + 15).map(x =>
+					{{
+						if(!x) return [0, 0, "NoData"];
+						var date = x.match(/(\d+)\/(\d+)/);
+						if(x.includes("公認欠席"))  return [parseInt(date[1]), parseInt(date[2]), "Authorized"];
+						else if(x.includes("欠席")) return [parseInt(date[1]), parseInt(date[2]), "Absence"];
+						else if(x.includes("出席")) return [parseInt(date[1]), parseInt(date[2]), "Presence"];
+						else return [parseInt(date[1]), parseInt(date[2]), "NoData"];
+					}})
+				}});
+			}}
+			JSON.stringify(subjects)
+		"#, Self::COMMONCODE, Self::TABLE_ID)).and_then(|s| serde_json::from_str(&s.assume_string()).map_err(From::from))
 	}
 	/// 期間別出席率テーブルの取得
 	pub fn parse_attendance_rates(&mut self) -> GenericResult<Vec<PeriodAttendanceRate>>
 	{
 		let rctx = Some(self.main_frame_context());
 		self.remote.query_value(rctx, &format!(r#"
-			function toPeriod(s) {{
-				switch(s) {{
-				case "1 Q": return "FirstQuarter"; case "2 Q": return "SecondQuarter";
-				case "3 Q": return "ThirdQuarter";  case "4 Q": return "FourthQuarter";
-				case "前期": return "FirstStage"; case "後期": return "LateStage";
-				case "通年": return "WholeYear"; default: console.assert(false);
-				}}
-			}}
+			{}
 			var table = document.getElementById({:?});
 			var cells = Array.prototype.map.call(table.querySelectorAll("tr:not(:first-child) td"), x => x.textContent.trim());
 			var ret = [];
@@ -703,11 +703,11 @@ impl CampusPlanAttendanceDetailsFrames
 				ret.push({{firstYear: parseInt(row[0]), startingPeriod: toPeriod(row[1]), rates: parseFloat(row[2].substring(row[2].search(/\d+(\.\d+)?/)))}});
 			}}
 			JSON.stringify(ret)
-		"#, Self::BY_PERIOD_TABLE_ID)).map_err(From::from).and_then(|x| serde_json::from_str(&x.assume_string()).map_err(From::from))
+		"#, Self::COMMONCODE, Self::BY_PERIOD_TABLE_ID)).and_then(|x| serde_json::from_str(&x.assume_string()).map_err(From::from))
 	}
 }
 /// 出欠テーブル: 科目行
-#[derive(Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)] #[serde(rename_all = "camelCase")]
 pub struct SubjectAttendanceState
 {
 	#[doc = "講義コード"] pub code: String,
@@ -719,7 +719,7 @@ pub struct SubjectAttendanceState
 	#[doc = "セルデータ"] pub attendance_cells: Vec<(u32, u32, DayAttendanceState)>
 }
 /// 出席率テーブル
-#[derive(Serialize, Deserialize)] #[serde(rename_all = "camelCase")]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)] #[serde(rename_all = "camelCase")]
 pub struct PeriodAttendanceRate
 {
 	#[doc = "初年度"] pub first_year: u32,
@@ -727,7 +727,7 @@ pub struct PeriodAttendanceRate
 	#[doc = "出席率"] pub rates: f32
 }
 /// 開講時期
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Period
 {
 	#[doc = "通年"] WholeYear,
@@ -735,41 +735,15 @@ pub enum Period
 	#[doc = "1Q"] FirstQuarter, #[doc = "2Q"] SecondQuarter, #[doc = "3Q"] ThirdQuarter, #[doc = "4Q"] FourthQuarter
 }
 /// 曜日
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Week
 {
 	Monday, Tuesday, Wednesday, Thursday, Friday, Saturday
 }
 /// 出席状態
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DayAttendanceState
 {
 	#[doc = "データなし"] NoData,
 	#[doc = "出席"] Presence, #[doc = "欠席"] Absence, #[doc = "公認欠席"] Authorized
-}
-impl FromStr for Period
-{
-	type Err = ();
-	fn from_str(s: &str) -> Result<Self, ()>
-	{
-		match s
-		{
-			"通年" => Ok(Period::WholeYear), "前期" => Ok(Period::FirstStage), "後期" => Ok(Period::LateStage),
-			"1 Q" => Ok(Period::FirstQuarter), "2 Q" => Ok(Period::SecondQuarter), "3 Q" => Ok(Period::ThirdQuarter),
-			"4 Q" => Ok(Period::FourthQuarter), _ => Err(())
-		}
-	}
-}
-impl FromStr for Week
-{
-	type Err = ();
-	fn from_str(s: &str) -> Result<Self, ()>
-	{
-		match s
-		{
-			"月曜日" => Ok(Week::Monday), "火曜日" => Ok(Week::Tuesday), "水曜日" => Ok(Week::Wednesday),
-			"木曜日" => Ok(Week::Thursday), "金曜日" => Ok(Week::Friday), "土曜日" => Ok(Week::Saturday),
-			_ => Err(())
-		}
-	}
 }

@@ -10,7 +10,6 @@ extern crate serde;
 #[macro_use]
 extern crate serde_derive;
 extern crate serde_json;
-extern crate regex;
 
 use tokio_core::reactor::Core;
 use futures::{Future, Stream};
@@ -122,16 +121,17 @@ fn main()
 	// let mut intersysmenu = pctrl.jump_into_intersys().unwrap().isolate_mainframe().unwrap();
 
 	// 学生プロファイルと履修科目テーブル
-	let mut cdetails = intersysmenu.access_course_category().unwrap().access_details().unwrap();
+	/*let mut cdetails = intersysmenu.access_course_category().unwrap().access_details().unwrap();
 	let profile = cdetails.parse_profile().unwrap();
-	println!("{}", serde_json::to_string(&profile).unwrap());
-	println!("{}", serde_json::to_string(&cdetails.parse_course_table().unwrap()).unwrap());
-	println!("{}", serde_json::to_string(&cdetails.parse_graduation_requirements_table().unwrap()).unwrap());
+	println!("{:?}", profile);
+	println!("{:?}", cdetails.parse_course_table().unwrap());
+	println!("{:?}", cdetails.parse_graduation_requirements_table().unwrap());*/
 
 	// 出席率を取りたい
-	let mut adetails = cdetails.access_attendance_category().unwrap().access_details().unwrap();
-	println!("{}", serde_json::to_string(&adetails.parse_current_year_table().unwrap()).unwrap());
-	println!("{}", serde_json::to_string(&adetails.parse_attendance_rates().unwrap()).unwrap());
+	// let mut adetails = cdetails.access_attendance_category().unwrap().access_details().unwrap();
+	let mut adetails = intersysmenu.access_attendance_category().unwrap().access_details().unwrap();
+	println!("{:?}", adetails.parse_current_year_table().unwrap());
+	println!("{:?}", adetails.parse_attendance_rates().unwrap());
 }
 
 fn prompt(text: &str) -> String
