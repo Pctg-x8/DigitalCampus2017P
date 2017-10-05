@@ -664,7 +664,7 @@ impl CampusPlanAttendanceDetailsFrames
 					time: parseInt(cells[i + 4].substring(cells[i + 4].search(/\d+/)).replace(/[０-ｚ]/g,
 						x => String.fromCharCode(x.charCodeAt(0) - 65248))),
 					rate: parseFloat(cells[i + 5].substring(cells[i + 5].search(/\d+(\.\d+)?/))),
-					attendanceCells: cells.slice(i + 6, i + 6 + 15).map(x =>
+					states: cells.slice(i + 6, i + 6 + 15).map(x =>
 					{{
 						if(!x) return [0, 0, "NoData"];
 						var date = x.match(/(\d+)\/(\d+)/);
@@ -705,7 +705,7 @@ pub struct SubjectAttendanceState
 	#[doc = "代表曜日"] pub week: Week,
 	#[doc = "代表時限"] pub time: u32,
 	#[doc = "出席率"] pub rate: f32,
-	#[doc = "セルデータ"] pub attendance_cells: Vec<(u32, u32, DayAttendanceState)>
+	#[doc = "日ごとの出欠状態"] pub states: Vec<(u32, u32, AttendanceState)>
 }
 /// 出席率テーブル
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)] #[serde(rename_all = "camelCase")]
@@ -731,7 +731,7 @@ pub enum Week
 }
 /// 出席状態
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DayAttendanceState
+pub enum AttendanceState
 {
 	#[doc = "データなし"] NoData,
 	#[doc = "出席"] Presence, #[doc = "欠席"] Absence, #[doc = "公認欠席"] Authorized
