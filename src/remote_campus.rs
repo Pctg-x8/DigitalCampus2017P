@@ -226,6 +226,8 @@ impl ScriptContextState
 	}
 }
 
+#[cfg(feature = "verbose")] use colored::*;
+
 trait Breakability { fn require_break(self) -> bool; }
 impl Breakability for () { fn require_break(self) -> bool { false } }
 impl Breakability for bool { fn require_break(self) -> bool { self } }
@@ -260,7 +262,7 @@ macro_rules! SessionEventLoop
 		loop
 		{
 			let s = $session.wait_text()?;
-			#[cfg(feature = "verbose")] println!("[SessionEventLoop]Received: {:?}", s);
+			#[cfg(feature = "verbose")] println!("{}", format!("<<-- [SessionEventLoop]Received: {}", s).blue().bold());
 			let obj: headless_chrome::SessionReceiveEvent = ::serde_json::from_str(&s)?;
 			match obj
 			{

@@ -118,6 +118,7 @@ impl<W: Write, R: Read> Session<W, R>
 		}
 	}
 }
+#[cfg(feature = "verbose")] use colored::*;
 impl<W: Write, R: Read> Session<W, R>
 {
 	pub fn wait_message(&mut self) -> WebSocketResult<OwnedMessage>
@@ -144,7 +145,7 @@ impl<W: Write, R: Read> Session<W, R>
 		loop
 		{
 			let s = self.wait_text()?;
-			#[cfg(feature = "verbose")] println!("[wait_event]Received: {:?}", s);
+			#[cfg(feature = "verbose")] println!("{}", format!("<<-- [wait_event]Received: {}", s).blue().bold());
 			let obj: SessionReceiveEvent = serde_json::from_str(&s)?;
 			match obj
 			{
@@ -168,7 +169,7 @@ impl<W: Write, R: Read> Session<W, R>
 		loop
 		{
 			let s = self.wait_text()?;
-			#[cfg(feature = "verbose")] println!("[wait_result]Received: {:?}", s);
+			#[cfg(feature = "verbose")] println!("{}", format!("<<-- [wait_result]Received: {}", s).blue().bold());
 			let obj: SessionReceiveEvent = serde_json::from_str(&s)?;
 			match obj
 			{
@@ -187,7 +188,7 @@ impl<W: Write, R: Read> Session<W, R>
 	fn send_text(&mut self, text: String) -> WebSocketResult<()>
 	{
 		// println!("Sending {}", text);
-		#[cfg(feature = "verbose")] println!("[send]Sending: {}", text);
+		#[cfg(feature = "verbose")] println!("{}", format!("-->> [send]Sending: {}", text).green().bold());
 		self.sender.send_message(&OwnedMessage::Text(text))
 	}
 	fn send<T: Serialize>(&mut self, payload: &T) -> WebSocketResult<()>

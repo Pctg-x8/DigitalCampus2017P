@@ -11,6 +11,8 @@ extern crate serde;
 extern crate serde_derive;
 extern crate serde_json;
 
+#[cfg(feature = "verbose")] extern crate colored;
+
 use tokio_core::reactor::Core;
 use futures::{Future, Stream};
 use std::io::prelude::*;
@@ -121,15 +123,15 @@ fn main()
 	// let mut intersysmenu = pctrl.jump_into_intersys().unwrap().isolate_mainframe().unwrap();
 
 	// 学生プロファイルと履修科目テーブル
-	/*let mut cdetails = intersysmenu.access_course_category().unwrap().access_details().unwrap();
+	let mut cdetails = intersysmenu.access_course_category().unwrap().access_details().unwrap();
 	let profile = cdetails.parse_profile().unwrap();
 	println!("{:?}", profile);
 	println!("{:?}", cdetails.parse_course_table().unwrap());
-	println!("{:?}", cdetails.parse_graduation_requirements_table().unwrap());*/
+	println!("{:?}", cdetails.parse_graduation_requirements_table().unwrap());
 
 	// 出席率を取りたい
-	// let mut adetails = cdetails.access_attendance_category().unwrap().access_details().unwrap();
-	let mut adetails = intersysmenu.access_attendance_category().unwrap().access_details().unwrap();
+	let mut adetails = cdetails.access_attendance_category().unwrap().access_details().unwrap();
+	// let mut adetails = intersysmenu.access_attendance_category().unwrap().access_details().unwrap();
 	println!("{:?}", adetails.parse_current_year_table().unwrap());
 	println!("{:?}", adetails.parse_attendance_rates().unwrap());
 }
