@@ -103,10 +103,21 @@ impl RemoteCampus
 	{
 		self.query(context, &format!(r#"document.querySelector({:?}).click()"#, selector)).map(move |_| self)
 	}
+	pub fn click_nth_element(&mut self, context: Option<u64>, selector: &str, index: usize) -> GenericResult<&mut Self>
+	{
+		self.query(context, &format!(r#"document.querySelectorAll({:?})[{}].click()"#, selector, index)).map(move |_| self)
+	}
 	pub fn jump_to_anchor_href(&mut self, selector: &str) -> GenericResult<&mut Self>
 	{
 		let id = self.new_request_id(); let id2 = self.new_request_id();
 		let intersys_link_attrs = self.session.dom().get_root_node_sync(id)?.query_selector(selector)?.attributes()?;
+		let href_index = intersys_link_attrs.iter().position(|s| s == "href").unwrap() + 1;
+		self.session.page().navigate_sync(id2, intersys_link_attrs[href_index].as_str().unwrap()).map(move |_| self)
+	}
+	pub fn jump_to_nth_anchor_href(&mut self, selector: &str, index: usize) -> GenericResult<&mut Self>
+	{
+		let id = self.new_request_id(); let id2 = self.new_request_id();
+		let intersys_link_attrs = self.session.dom().get_root_node_sync(id)?.query_selector_nth(selector, index)?.attributes()?;
 		let href_index = intersys_link_attrs.iter().position(|s| s == "href").unwrap() + 1;
 		self.session.page().navigate_sync(id2, intersys_link_attrs[href_index].as_str().unwrap()).map(move |_| self)
 	}
@@ -170,27 +181,76 @@ impl RemoteCampus
 		else { self.wait_loading()?; self.check_login_completion() }
 	}
 }
-/// メニューリンク処理
-impl HomePage
+
+pub trait ToplevelPageControl
+{
+	/// リモートコントローラ
+	fn remote_ctrl(&mut self) -> &mut RemoteCampus;
+	/// コントロール奪取
+	fn transfer_control(self) -> RemoteCampus;
+}
+pub trait IntersysAccessible : ToplevelPageControl + Sized
 {
 	const INTERSYS_LINK_PATH: &'static str = "#gnav ul li.menuBlock ul li:first-child a";
 
 	/// "履修・成績・出席"リンクへ
 	/// 将来的にmenuBlockクラスが複数出てきたらまた考えます
-	pub fn access_intersys(mut self) -> GenericResult<CampusPlanEntryFrames>
+	fn access_intersys(mut self) -> GenericResult<CampusPlanEntryFrames>
 	{
-		self.remote.jump_to_anchor_href(Self::INTERSYS_LINK_PATH)?;
-		let mut r = CampusPlanFrames::enter(self.remote);
+		self.remote_ctrl().jump_to_anchor_href(Self::INTERSYS_LINK_PATH)?;
+		let mut r = CampusPlanFrames::enter(self.transfer_control());
 		r.wait_frame_context(true)?; Ok(r)
 	}
+	/// "履修・成績・出席"リンクへ(別セッションで立ち上がる)
+	/// 将来的にmenuBlockクラスが複数出てきたらまた考えます
+	fn access_intersys_blank(&mut self) -> GenericResult<()>
+	{
+		self.remote_ctrl().click_element(None, Self::INTERSYS_LINK_PATH)
+	}
 }
+impl ToplevelPageControl for HomePage
+{
+	fn remote_ctrl(&mut self) -> &mut RemoteCampus { &mut self.remote } fn transfer_control(self) -> RemoteCampus { self.remote }
+}
+impl ToplevelPageControl for AllNotificationsPage
+{
+	fn remote_ctrl(&mut self) -> &mut RemoteCampus { &mut self.remote } fn transfer_control(self) -> RemoteCampus { self.remote }
+}
+impl ToplevelPageControl for AllClassNotificationsPage
+{
+	fn remote_ctrl(&mut self) -> &mut RemoteCampus { &mut self.remote } fn transfer_control(self) -> RemoteCampus { self.remote }
+}
+impl ToplevelPageControl for AllLectureNotesPage
+{
+	fn remote_ctrl(&mut self) -> &mut RemoteCampus { &mut self.remote } fn transfer_control(self) -> RemoteCampus { self.remote }
+}
+impl ToplevelPageControl for AllLectureNotificationsPage
+{
+	fn remote_ctrl(&mut self) -> &mut RemoteCampus { &mut self.remote } fn transfer_control(self) -> RemoteCampus { self.remote }
+}
+impl ToplevelPageControl for AllFeedbackSheetNotificationsPage
+{
+	fn remote_ctrl(&mut self) -> &mut RemoteCampus { &mut self.remote } fn transfer_control(self) -> RemoteCampus { self.remote }
+}
+impl ToplevelPageControl for AllHomeworkNotificationsPage
+{
+	fn remote_ctrl(&mut self) -> &mut RemoteCampus { &mut self.remote } fn transfer_control(self) -> RemoteCampus { self.remote }
+}
+impl IntersysAccessible for HomePage {}
+impl IntersysAccessible for AllNotificationsPage {}
+impl IntersysAccessible for AllClassNotificationsPage {}
+impl IntersysAccessible for AllLectureNotesPage {}
+impl IntersysAccessible for AllLectureNotificationsPage {}
+impl IntersysAccessible for AllFeedbackSheetNotificationsPage {}
+impl IntersysAccessible for AllHomeworkNotificationsPage {}
 
 /// トップコンテンツ取得
 impl HomePage
 {
 	const MAINCONTENTS_ID: &'static str = "mainContents";
-	const NEWSBOX_LIST: &'static str = "#mainContents div.homeNewsBox";
+	const NEWSBOX_LIST: &'static str = "#mainContents .homeNewsBox";
 	const NEWSBOX_CONTENT_ROWS: &'static str = "table:nth-child(2) tr.pointer";
+	const TOALL_LINK_PATH: &'static str = ".toAll a";
 	const COMMONFN_TRANSLATE_NS: &'static str = r#"function translateNotificationState(s) {
 		switch(s) {
 		case "未読": return "Unread"; case "既読": return "Read";
@@ -234,8 +294,15 @@ impl HomePage
 			})).stringify().with_header(Self::COMMONFN_TRANSLATE_NS))?.assume();
 		Ok(serde_json::from_str(&q).expect("Protocol Corruption"))
 	}
+	/// すべてのお知らせが見れるページに飛ぶ
+	pub fn access_all_notifications(mut self) -> GenericResult<AllNotificationsPage>
+	{
+		// self.remote.jump_to_anchor_href(&format!("{}:nth-child(1) {}", Self::NEWSBOX_LIST, Self::TOALL_LINK_PATH))?.wait_loading()?;
+		self.remote.click_element(None, &format!("{}:nth-child(1) {}", Self::NEWSBOX_LIST, Self::TOALL_LINK_PATH))?.wait_loading()?;
+		Ok(AllNotificationsPage { remote: self.remote })
+	}
 	/// 授業関連の最新のお知らせ(〜3件?)を取得
-	pub fn acquire_lecture_notifications_latest(&mut self) -> GenericResult<Vec<LectureNotification>>
+	pub fn acquire_lecture_notifications_latest(&mut self) -> GenericResult<Vec<ClassNotification>>
 	{
 		let q: String = self.remote.query_value(None, &Self::query_rows(2).map_auto("r",
 			Self::query_all_row_contents(jsq::CustomExpression::<jsq::types::Element>("r".into(), PhantomData)).map_value_auto("cells", jsqGenObject!{
@@ -243,6 +310,24 @@ impl HomePage
 				state: "translateNotificationState(cells[5])", onClickScript: r#"r.getAttribute("onclick").substring("javascript:".length)"#
 			})).stringify().with_header(Self::COMMONFN_TRANSLATE_NS))?.assume();
 		Ok(serde_json::from_str(&q).expect("Protocol Corruption"))
+	}
+	/// すべての休講・補講・教室変更一覧が見れるページに飛ぶ
+	pub fn access_all_class_notifications(mut self) -> GenericResult<AllClassNotificationsPage>
+	{
+		self.remote.click_nth_element(None, &format!("{}:nth-child(2) {}", Self::NEWSBOX_LIST, Self::TOALL_LINK_PATH), 0)?.wait_loading()?;
+		Ok(AllClassNotificationsPage { remote: self.remote })
+	}
+	/// すべての授業資料一覧が見れるページに飛ぶ
+	pub fn access_all_lecture_notes(mut self) -> GenericResult<AllLectureNotesPage>
+	{
+		self.remote.click_nth_element(None, &format!("{}:nth-child(2) {}", Self::NEWSBOX_LIST, Self::TOALL_LINK_PATH), 1)?.wait_loading()?;
+		Ok(AllLectureNotesPage { remote: self.remote })
+	}
+	/// すべての授業関連の連絡一覧が見れるページに飛ぶ
+	pub fn access_all_lecture_notifications(mut self) -> GenericResult<AllLectureNotificationsPage>
+	{
+		self.remote.click_nth_element(None, &format!("{}:nth-child(2) {}", Self::NEWSBOX_LIST, Self::TOALL_LINK_PATH), 2)?.wait_loading()?;
+		Ok(AllLectureNotificationsPage { remote: self.remote })
 	}
 	/// フィードバックシート回答待ちリストの取得
 	pub fn acquire_feedback_sheets(&mut self) -> GenericResult<Vec<FeedbackSheetNotification>>
@@ -256,6 +341,12 @@ impl HomePage
 			})).stringify().with_header(Self::COMMONFN_TRANSLATE_NS))?.assume();
 		Ok(serde_json::from_str(&q).expect("Protocol Corruption"))
 	}
+	/// すべての回答待ちフィードバックシート一覧が見れるページに飛ぶ
+	pub fn access_all_feedback_sheets(mut self) -> GenericResult<AllFeedbackSheetNotificationsPage>
+	{
+		self.remote.click_element(None, &format!("{}:nth-child(3) {}", Self::NEWSBOX_LIST, Self::TOALL_LINK_PATH))?.wait_loading()?;
+		Ok(AllFeedbackSheetNotificationsPage { remote: self.remote })
+	}
 	/// 課題回答待ちリストの取得
 	pub fn acquire_homeworks(&mut self) -> GenericResult<Vec<HomeworkNotification>>
 	{
@@ -266,6 +357,116 @@ impl HomePage
 				onClickScript: r#"r.getAttribute("onclick").substring("javascript:".length)"#
 			})).stringify().with_header(Self::COMMONFN_TRANSLATE_NS))?.assume();
 		Ok(serde_json::from_str(&q).expect("Protocol Corruption"))
+	}
+	/// すべての回答待ち課題一覧が見れるページに飛ぶ
+	pub fn access_all_homeworks(mut self) -> GenericResult<AllHomeworkNotificationsPage>
+	{
+		self.remote.click_element(None, &format!("{}:nth-child(4) {}", Self::NEWSBOX_LIST, Self::TOALL_LINK_PATH))?.wait_loading()?;
+		Ok(AllHomeworkNotificationsPage { remote: self.remote })
+	}
+}
+/// お知らせ一覧のページ
+pub struct AllNotificationsPage { remote: RemoteCampus }
+/// 休講/補講/教室変更お知らせ一覧のページ
+pub struct AllClassNotificationsPage { remote: RemoteCampus }
+/// 授業資料一覧のページ
+pub struct AllLectureNotesPage { remote: RemoteCampus }
+/// その他講義関連の連絡一覧のページ
+pub struct AllLectureNotificationsPage { remote: RemoteCampus }
+/// フィードバックシート回答待ち一覧のページ
+pub struct AllFeedbackSheetNotificationsPage { remote: RemoteCampus }
+/// 課題回答待ち一覧のページ
+pub struct AllHomeworkNotificationsPage { remote: RemoteCampus }
+
+/// 通知一覧ページの共通実装
+pub trait NotificationListPage : ToplevelPageControl
+{
+	/// 自身が返す通知行の型
+	type NotificationTy : ::serde::de::DeserializeOwned;
+	/// 通知行オブジェクトを構成するJSQ Fragment("cells"にデータが入っているので、それを加工するJSQ Fragment)
+	fn jsqf_notification_gen() -> jsq::ObjectConstructor<'static, 'static>;
+
+	/// すべての通知を取得
+	fn acquire_notifications(&mut self) -> GenericResult<Vec<Self::NotificationTy>>
+	{
+		let row = jsqCustomExpr!([jsq::types::Element] "r").query_selector_all("td".into())
+			.map_auto("x", jsqCustomExpr!([jsq::types::String] "x.textContent.trim()"))
+			.map_value_auto("cells", Self::jsqf_notification_gen()).into_closure("r");
+		let q = jsq::Document.query_selector_all("#mainContents .homeNewsBox .pointer".into()).map(row).stringify();
+		let qv: String = self.remote_ctrl().query_value(None, &q.with_header(HomePage::COMMONFN_TRANSLATE_NS))?.assume();
+		Ok(serde_json::from_str(&qv).expect("Protocol Corruption"))
+	}
+}
+const REFORMAT_DATE_CELLS_1: &'static str = r#"cells[1].replace(/(\d+)\/(\d+)\/(\d+)/, "$1-$2-$3T00:00:00Z")"#;
+impl NotificationListPage for AllNotificationsPage
+{
+	type NotificationTy = Notification;
+	fn jsqf_notification_gen() -> jsq::ObjectConstructor<'static, 'static>
+	{
+		jsqGenObject!{
+			category: "cells[0]", date: REFORMAT_DATE_CELLS_1, priority: "cells[2]", title: "cells[3]", from: "cells[4]",
+			state: "translateNotificationState(cells[5])", onClickScript: r#"r.getAttribute("onclick").substring("javascript:".length)"#
+		}
+	}
+}
+impl NotificationListPage for AllClassNotificationsPage
+{
+	type NotificationTy = ClassNotification;
+	fn jsqf_notification_gen() -> jsq::ObjectConstructor<'static, 'static>
+	{
+		jsqGenObject!{
+			category: "cells[0]", date: REFORMAT_DATE_CELLS_1, priority: "cells[2]", lectureTitle: "cells[3]", title: "cells[4]",
+			state: "translateNotificationState(cells[5])", onClickScript: r#"r.getAttribute("onclick").substring("javascript:".length)"#
+		}
+	}
+}
+const REFORMAT_DATE_CELLS_0: &'static str = r#"cells[0].replace(/(\d+)\/(\d+)\/(\d+)/, "$1-$2-$3T00:00:00Z")"#;
+impl NotificationListPage for AllLectureNotesPage
+{
+	type NotificationTy = LectureNotification;
+	fn jsqf_notification_gen() -> jsq::ObjectConstructor<'static, 'static>
+	{
+		jsqGenObject!{
+			date: REFORMAT_DATE_CELLS_0, priority: "cells[1]", lectureTitle: "cells[2]", title: "cells[3]",
+			state: "translateNotificationState(cells[4])", onClickScript: r#"r.getAttribute("onclick").substring("javascript:".length)"#
+		}
+	}
+}
+impl NotificationListPage for AllLectureNotificationsPage
+{
+	type NotificationTy = LectureNotification;
+	fn jsqf_notification_gen() -> jsq::ObjectConstructor<'static, 'static>
+	{
+		jsqGenObject!{
+			date: REFORMAT_DATE_CELLS_0, priority: "cells[1]", lectureTitle: "cells[2]", title: "cells[3]",
+			state: "translateNotificationState(cells[4])", onClickScript: r#"r.getAttribute("onclick").substring("javascript:".length)"#
+		}
+	}
+}
+const REFORMAT_DATETIME_CELLS_3: &'static str = r#"cells[3].replace(/(\d+)\/(\d+)\/(\d+)\s*(\d+:\d+)/, "$1-$2-$3T$4:00Z")"#;
+impl NotificationListPage for AllFeedbackSheetNotificationsPage
+{
+	type NotificationTy = FeedbackSheetNotification;
+	fn jsqf_notification_gen() -> jsq::ObjectConstructor<'static, 'static>
+	{
+		jsqGenObject!{
+			lectureDate: REFORMAT_DATE_CELLS_0, lectureTitle: "cells[1]",
+			time: "parseInt(cells[2].replace(/[０-９]/g, x => String.fromCharCode(x.charCodeAt(0) - 65248)))",
+			deadline: REFORMAT_DATETIME_CELLS_3, state: "translateNotificationState(cells[4])",
+			onClickScript: r#"r.getAttribute("onclick").substring("javascript:".length)"#
+		}
+	}
+}
+impl NotificationListPage for AllHomeworkNotificationsPage
+{
+	type NotificationTy = HomeworkNotification;
+	fn jsqf_notification_gen() -> jsq::ObjectConstructor<'static, 'static>
+	{
+		jsqGenObject!{
+			date: REFORMAT_DATE_CELLS_0, lectureTitle: "cells[1]", title: "cells[2]",
+			deadline: REFORMAT_DATETIME_CELLS_3, state: "translateNotificationState(cells[4])",
+			onClickScript: r#"r.getAttribute("onclick").substring("javascript:".length)"#
+		}
 	}
 }
 
@@ -278,9 +479,16 @@ pub struct Notification
 }
 /// 講義関連お知らせ行
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] #[serde(rename_all = "camelCase")]
-pub struct LectureNotification
+pub struct ClassNotification
 {
 	pub category: String, pub date: DateTime<Utc>, pub priority: String, pub lecture_title: String, pub title: String,
+	pub state: NotificationState, pub on_click_script: String
+}
+/// 講義連絡行
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] #[serde(rename_all = "camelCase")]
+pub struct LectureNotification
+{
+	pub date: DateTime<Utc>, pub priority: String, pub lecture_title: String, pub title: String,
 	pub state: NotificationState, pub on_click_script: String
 }
 /// フィードバックシート回答待ち行

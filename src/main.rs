@@ -1,5 +1,5 @@
 
-#![feature(iterator_step_by, box_syntax)]
+#![feature(iterator_step_by, box_syntax, const_fn)]
 
 extern crate tokio_core;
 extern crate hyper;
@@ -57,7 +57,7 @@ type GenericResult<T> = Result<T, Box<Error>>;
 mod headless_chrome;
 #[macro_use] mod jsquery;
 mod remote_campus;
-use remote_campus::RemoteCampus;
+use remote_campus::{RemoteCampus, IntersysAccessible, NotificationListPage};
 
 fn process_login(mut pctrl: remote_campus::LoginPage) -> remote_campus::HomePage
 {
@@ -126,8 +126,14 @@ fn main()
 	println!("{:?}", pctrl.acquire_feedback_sheets().unwrap());
 	println!("{:?}", pctrl.acquire_homeworks().unwrap());
 
+	let mut all_notifications = pctrl.access_all_notifications().unwrap();
+	println!("{:?}", all_notifications.acquire_notifications().unwrap());
+
+	all_notifications.access_intersys_blank().unwrap();
+
+	/*
 	// println!("履修ページへアクセスしています...");
-	let intersysmenu = pctrl.access_intersys().unwrap();
+	let intersysmenu = all_notifications.access_intersys().unwrap();
 	// let mut intersysmenu = pctrl.jump_into_intersys().unwrap().isolate_mainframe().unwrap();
 
 	// 学生プロファイルと履修科目テーブル
@@ -142,6 +148,7 @@ fn main()
 	// let mut adetails = intersysmenu.access_attendance_category().unwrap().access_details().unwrap();
 	println!("{:?}", adetails.parse_current_year_table().unwrap());
 	println!("{:?}", adetails.parse_attendance_rates().unwrap());
+	*/
 }
 
 fn prompt(text: &str) -> String

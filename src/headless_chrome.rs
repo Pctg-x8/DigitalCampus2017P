@@ -215,6 +215,11 @@ pub mod dom
 		{
 			self.domain.query_selector_sync(1000, self.id, selector).map(move |nid| Node { domain: self.domain, id: nid })
 		}
+		pub fn query_selector_nth<'ss: 's>(&'ss mut self, selector: &str, index: usize) -> super::GenericResult<Node<'s, 'c, W, R>>
+		{
+			let ref nid = self.domain.query_selector_all_sync(1000, self.id, selector)?[index];
+			Ok(Node { domain: self.domain, id: nid.as_i64().unwrap() as _ })
+		}
 		pub fn query_selector_all(&mut self, selector: &str) -> super::GenericResult<Vec<i64>>
 		{
 			self.domain.query_selector_all_sync(1000, self.id, selector).map(|v| v.into_iter().map(|x| x.as_i64().unwrap()).collect())
