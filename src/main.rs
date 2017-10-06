@@ -10,6 +10,7 @@ extern crate serde;
 #[macro_use]
 extern crate serde_derive;
 extern crate serde_json;
+extern crate chrono;
 
 #[cfg(feature = "verbose")] extern crate colored;
 
@@ -54,6 +55,7 @@ macro_rules! jvDecomposite
 type GenericResult<T> = Result<T, Box<Error>>;
 
 mod headless_chrome;
+#[macro_use] mod jsquery;
 mod remote_campus;
 use remote_campus::RemoteCampus;
 
@@ -101,7 +103,7 @@ fn main()
 	println!("Connecting {}...", session_list[0]);
 	let dc = RemoteCampus::connect(&session_list[0]).expect("Failed to connect to a session in the Headless Chrome");
 	println!("  Connection established.");
-	let pctrl = dc.check_login_completion().expect("Failed waiting initial login completion").unwrap_or_else(move |mut e|
+	let mut pctrl = dc.check_login_completion().expect("Failed waiting initial login completion").unwrap_or_else(move |mut e|
 	{
 		// println!("Logging-in required for DigitalCampus");
 		println!("デジキャンへのログインが必要です。");
@@ -118,6 +120,12 @@ fn main()
 		}
 		else { process_login(e) }
 	});
+
+	println!("{:?}", pctrl.acquire_notifications_latest().unwrap());
+	println!("{:?}", pctrl.acquire_lecture_notifications_latest().unwrap());
+	println!("{:?}", pctrl.acquire_feedback_sheets().unwrap());
+	println!("{:?}", pctrl.acquire_homeworks().unwrap());
+
 	// println!("履修ページへアクセスしています...");
 	let intersysmenu = pctrl.access_intersys().unwrap();
 	// let mut intersysmenu = pctrl.jump_into_intersys().unwrap().isolate_mainframe().unwrap();

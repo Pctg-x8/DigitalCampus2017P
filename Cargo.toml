@@ -16,6 +16,7 @@ serde_derive = "1.0"
 serde_json = "1.0"
 websocket = "0.20"
 regex = "0.2"
+chrono = { version = "0.4", features = ["serde"] }
 
 colored = { version = "1.5", optional = true }
 

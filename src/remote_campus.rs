@@ -9,9 +9,12 @@ use serde_json;
 use serde_json::{Value as JValue, Map as JMap};
 use std::marker::PhantomData;
 use std::mem::{replace, transmute};
+use chrono::prelude::*;
 
 use headless_chrome::{page, runtime};
-// use headless_chrome::runtime::JSONTyping;
+use headless_chrome::runtime::JSONTyping;
+use jsquery as jsq;
+use jsquery::QueryCombinator;
 
 pub trait QueryValueType<T: Sized>: Sized { fn unwrap(self) -> T; }
 impl QueryValueType<JMap<String, JValue>> for JValue
@@ -167,9 +170,11 @@ impl RemoteCampus
 		else { self.wait_loading()?; self.check_login_completion() }
 	}
 }
+/// メニューリンク処理
 impl HomePage
 {
 	const INTERSYS_LINK_PATH: &'static str = "#gnav ul li.menuBlock ul li:first-child a";
+
 	/// "履修・成績・出席"リンクへ
 	/// 将来的にmenuBlockクラスが複数出てきたらまた考えます
 	pub fn access_intersys(mut self) -> GenericResult<CampusPlanEntryFrames>
@@ -178,6 +183,125 @@ impl HomePage
 		let mut r = CampusPlanFrames::enter(self.remote);
 		r.wait_frame_context(true)?; Ok(r)
 	}
+}
+
+/// トップコンテンツ取得
+impl HomePage
+{
+	const MAINCONTENTS_ID: &'static str = "mainContents";
+	const NEWSBOX_LIST: &'static str = "#mainContents div.homeNewsBox";
+	const NEWSBOX_CONTENT_ROWS: &'static str = "table:nth-child(2) tr.pointer";
+	const COMMONFN_TRANSLATE_NS: &'static str = r#"function translateNotificationState(s) {
+		switch(s) {
+		case "未読": return "Unread"; case "既読": return "Read";
+		case "未回答": return "Unanswered"; case "回答済": return "Answered";
+		case "未提出": return "Unsubmitted"; case "提出済": return "Submitted";
+		default: console.assert(0);
+		}
+	}"#;
+	
+	fn query_all_row_contents<Source: QueryCombinator>(row: Source)
+		-> jsq::Mapping<jsq::QuerySelectorAll<Source>, jsq::Closure<'static, jsq::CustomExpression<jsq::types::String>>>
+		where Source::ValueTy: jsq::types::QueryableElements
+	{
+		row.query_selector_all("td".into()).map_auto("x", jsq::CustomExpression::<jsq::types::String>("x.textContent.trim()".into(), PhantomData))
+	}
+	fn query_rows(index1: usize) -> jsq::QuerySelectorAll<jsq::Document>
+	{
+		jsq::Document.query_selector_all(format!("{}:nth-child({}) {}", Self::NEWSBOX_LIST, index1, Self::NEWSBOX_CONTENT_ROWS))
+	}
+	fn gen_object(values: &[(&str, &str)]) -> jsq::CustomExpression<jsq::types::Object>
+	{
+		jsq::CustomExpression(format!("({{ {} }})",
+			values.into_iter().map(|&(ref k, ref v)| format!("{}: {}", k, v)).collect::<Vec<String>>().join(",")), PhantomData)
+	}
+	fn reformat_date(expr: &str) -> String
+	{
+		format!(r#"{}.replace(/(\d+)\/(\d+)\/(\d+)/, "$1-$2-$3T00:00:00Z")"#, expr)
+	}
+	fn reformat_datetime(expr: &str) -> String
+	{
+		format!(r#"{}.replace(/(\d+)\/(\d+)\/(\d+)\s*(\d+:\d+)/, "$1-$2-$3T$4:00Z")"#, expr)
+	}
+
+	/// 最新のお知らせ(5件?)を取得
+	pub fn acquire_notifications_latest(&mut self) -> GenericResult<Vec<Notification>>
+	{
+		let q: String = self.remote.query_value(None, &Self::query_rows(1).map_auto("r",
+			Self::query_all_row_contents(jsq::CustomExpression::<jsq::types::Element>("r".into(), PhantomData)).map_value_auto("cells", jsqGenObject!{
+				category: "cells[0]", date: &Self::reformat_date("cells[1]"), priority: "cells[2]", title: "cells[3]", from: "cells[4]",
+				state: "translateNotificationState(cells[5])", onClickScript: r#"r.getAttribute("onclick").substring("javascript:".length)"#
+			})).stringify().with_header(Self::COMMONFN_TRANSLATE_NS))?.assume();
+		Ok(serde_json::from_str(&q).expect("Protocol Corruption"))
+	}
+	/// 授業関連の最新のお知らせ(〜3件?)を取得
+	pub fn acquire_lecture_notifications_latest(&mut self) -> GenericResult<Vec<LectureNotification>>
+	{
+		let q: String = self.remote.query_value(None, &Self::query_rows(2).map_auto("r",
+			Self::query_all_row_contents(jsq::CustomExpression::<jsq::types::Element>("r".into(), PhantomData)).map_value_auto("cells", jsqGenObject!{
+				category: "cells[0]", date: &Self::reformat_date("cells[1]"), priority: "cells[2]", lectureTitle: "cells[3]", title: "cells[4]",
+				state: "translateNotificationState(cells[5])", onClickScript: r#"r.getAttribute("onclick").substring("javascript:".length)"#
+			})).stringify().with_header(Self::COMMONFN_TRANSLATE_NS))?.assume();
+		Ok(serde_json::from_str(&q).expect("Protocol Corruption"))
+	}
+	/// フィードバックシート回答待ちリストの取得
+	pub fn acquire_feedback_sheets(&mut self) -> GenericResult<Vec<FeedbackSheetNotification>>
+	{
+		let q: String = self.remote.query_value(None, &Self::query_rows(3).map_auto("r",
+			Self::query_all_row_contents(jsq::CustomExpression::<jsq::types::Element>("r".into(), PhantomData)).map_value_auto("cells", jsqGenObject!{
+				lectureDate: &Self::reformat_date("cells[0]"), lectureTitle: "cells[1]",
+				time: "parseInt(cells[2].replace(/[０-９]/g, x => String.fromCharCode(x.charCodeAt(0) - 65248)))",
+				deadline: &Self::reformat_datetime("cells[3]"), state: "translateNotificationState(cells[4])",
+				onClickScript: r#"r.getAttribute("onclick").substring("javascript:".length)"#
+			})).stringify().with_header(Self::COMMONFN_TRANSLATE_NS))?.assume();
+		Ok(serde_json::from_str(&q).expect("Protocol Corruption"))
+	}
+	/// 課題回答待ちリストの取得
+	pub fn acquire_homeworks(&mut self) -> GenericResult<Vec<HomeworkNotification>>
+	{
+		let q: String = self.remote.query_value(None, &Self::query_rows(4).map_auto("r",
+			Self::query_all_row_contents(jsq::CustomExpression::<jsq::types::Element>("r".into(), PhantomData)).map_value_auto("cells", jsqGenObject!{
+				date: &Self::reformat_date("cells[0]"), lectureTitle: "cells[1]", title: "cells[2]",
+				deadline: &Self::reformat_datetime("cells[3]"), state: "translateNotificationState(cells[4])",
+				onClickScript: r#"r.getAttribute("onclick").substring("javascript:".length)"#
+			})).stringify().with_header(Self::COMMONFN_TRANSLATE_NS))?.assume();
+		Ok(serde_json::from_str(&q).expect("Protocol Corruption"))
+	}
+}
+
+/// お知らせ行
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] #[serde(rename_all = "camelCase")]
+pub struct Notification
+{
+	pub category: String, pub date: DateTime<Utc>, pub priority: String, pub title: String, pub from: String,
+	pub state: NotificationState, pub on_click_script: String
+}
+/// 講義関連お知らせ行
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] #[serde(rename_all = "camelCase")]
+pub struct LectureNotification
+{
+	pub category: String, pub date: DateTime<Utc>, pub priority: String, pub lecture_title: String, pub title: String,
+	pub state: NotificationState, pub on_click_script: String
+}
+/// フィードバックシート回答待ち行
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] #[serde(rename_all = "camelCase")]
+pub struct FeedbackSheetNotification
+{
+	pub lecture_date: DateTime<Utc>, pub lecture_title: String, pub time: u32, pub deadline: DateTime<Utc>,
+	pub state: NotificationState, pub on_click_script: String
+}
+/// 課題回答待ち行
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)] #[serde(rename_all = "camelCase")]
+pub struct HomeworkNotification
+{
+	pub date: DateTime<Utc>, pub lecture_title: String, pub title: String, pub deadline: DateTime<Utc>,
+	pub state: NotificationState, pub on_click_script: String
+}
+/// 閲覧状態
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum NotificationState
+{
+	Unread, Read, Unanswered, Answered, Unsubmitted, Submitted
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -495,12 +619,13 @@ impl CampusPlanCourseDetailsFrames
 	pub fn parse_profile(&mut self) -> GenericResult<StudentProfile>
 	{
 		let rctx = Some(self.main_frame_context());
-		self.remote.query_value(rctx, r#"
-			var data = Array.prototype.map.call(document.querySelectorAll('#TableProfile tr:nth-child(2n) td:nth-child(2n)'), x => x.textContent.trim());
-			JSON.stringify({
-				id: data[0], name: data[1], course: data[2], grade: data[3], semester: data[4], address: data.slice(5, data.length)
-			})
-		"#).and_then(|s| serde_json::from_str(&s.assume_string()).map_err(From::from))
+		let q = jsq::Document.query_selector_all("#TableProfile tr:nth-child(2n) td:nth-child(2n)".into())
+			.map_auto("x", jsq::CustomExpression::<jsq::types::String>("x.textContent.trim()".into(), PhantomData))
+			.map_value_auto("data", jsqGenObject!{
+				id: "data[0]", name: "data[1]", course: "data[2]", grade: "data[3]", semester: "data[4]", address: "data.slice(5, data.length)"
+			}).stringify();
+		let q: String = self.remote.query_value(rctx, &q.to_string())?.assume();
+		Ok(serde_json::from_str(&q).expect("Protocol Corruption"))
 	}
 	/// 履修テーブルの取得
 	/// ## †履修テーブルの仕組み†
@@ -515,61 +640,52 @@ impl CampusPlanCourseDetailsFrames
 	pub fn parse_course_table(&mut self) -> GenericResult<CourseTable>
 	{
 		let rctx = Some(self.main_frame_context());
-		self.remote.query_value(rctx, r#"
-			var tables = document.querySelectorAll('table.rishu-tbl-cell');
-			// 前半クォーターは3、後半クォーターは5
-			var q1_koma_cells = tables[3].querySelectorAll('td.rishu-tbl-cell');
-			var q2_koma_cells = tables[5].querySelectorAll('td.rishu-tbl-cell');
-			var first_koma_cells = Array.prototype.map.call(q1_koma_cells, function(k)
-			{
-				var title_link = k.querySelector('a');
-				if(!title_link) return null; else return title_link.textContent.trim();
-			});
-			var last_koma_cells = Array.prototype.map.call(q2_koma_cells, function(k)
-			{
-				var title_link = k.querySelector('a');
-				if(!title_link) return null; else return title_link.textContent.trim();
-			});
+		let take_link_str = jsqCustomExpr!([jsq::types::Element] "k").query_selector("a".into())
+			.map_value_auto("title_link", jsqCustomExpr!([jsq::types::String] "(!title_link) ? null : title_link.textContent.trim()"))
+			.into_closure("k");
+		let q = jsq::Document.query_selector_all("table.rishu-tbl-cell".into())
+			.map_value_auto("tables", jsqCustomExpr!([jsq::types::Array<jsq::types::Element>] "[tables[3], tables[5]]"))
+			.map_auto("koma", jsqCustomExpr!([jsq::types::Element] "koma").query_selector_all("td.rishu-tbl-cell".into()).map(take_link_str));
+		self.remote.query_value(rctx, &format!(r#"
+			let komas = {};
 			var first_quarter = [], last_quarter = [];
-			for(var i = 0; i < first_koma_cells.length; i += 6)
-			{
-				first_quarter.push({
-					monday: first_koma_cells[i + 0], tuesday: first_koma_cells[i + 1], wednesday: first_koma_cells[i + 2],
-					thursday: first_koma_cells[i + 3], friday: first_koma_cells[i + 4], saturday: first_koma_cells[i + 5]
-				});
-				last_quarter.push({
-					monday: last_koma_cells[i + 0], tuesday: last_koma_cells[i + 1], wednesday: last_koma_cells[i + 2],
-					thursday: last_koma_cells[i + 3], friday: last_koma_cells[i + 4], saturday: last_koma_cells[i + 5]
-				});
-			}
-			JSON.stringify({ firstQuarter: first_quarter, lastQuarter: last_quarter })
-		"#).and_then(|s| serde_json::from_str(&s.assume_string()).map_err(From::from))
+			for(var i = 0; i < komas[0].length; i += 6)
+			{{
+				first_quarter.push({{
+					monday:   komas[0][i + 0], tuesday: komas[0][i + 1], wednesday: komas[0][i + 2],
+					thursday: komas[0][i + 3], friday:  komas[0][i + 4], saturday:  komas[0][i + 5]
+				}});
+				last_quarter.push({{
+					monday:   komas[1][i + 0], tuesday: komas[1][i + 1], wednesday: komas[1][i + 2],
+					thursday: komas[1][i + 3], friday:  komas[1][i + 4], saturday:  komas[1][i + 5]
+				}});
+			}}
+			JSON.stringify({{ firstQuarter: first_quarter, lastQuarter: last_quarter }})
+		"#, q)).and_then(|s| serde_json::from_str(&s.assume_string()).map_err(From::from))
 	}
 	/// 卒業要件集計欄のデータを取得
 	pub fn parse_graduation_requirements_table(&mut self) -> GenericResult<GraduationRequirements>
 	{
 		let rctx = Some(self.main_frame_context());
-		self.remote.query_value(rctx, r#"
-			var table = document.getElementById('dgrdSotsugyoYoken');
-			var cells = Array.prototype.map.call(table.querySelectorAll('tr.text-main td:not(:first-child)'), x => x.textContent.trim());
-			JSON.stringify({
-				requirements: {
-					intercom: parseInt(cells[0]), selfdev:  parseInt(cells[1]), general:  parseInt(cells[2]),
-					basic:    parseInt(cells[3]), practice: parseInt(cells[4]), research: parseInt(cells[5]),
-					totalRequired: parseInt(cells[6]), totalSelected: parseInt(cells[7]), total: 0
-				},
-				mastered: {
-					intercom: parseInt(cells[9 + 0]), selfdev:  parseInt(cells[9 + 1]), general:  parseInt(cells[9 + 2]),
-					basic:    parseInt(cells[9 + 3]), practice: parseInt(cells[9 + 4]), research: parseInt(cells[9 + 5]),
-					totalRequired: parseInt(cells[9 + 6]), totalSelected: parseInt(cells[9 + 7]), total: parseInt(cells[9 + 8])
-				},
-				current: {
-					intercom: parseInt(cells[18 + 0]), selfdev:  parseInt(cells[18 + 1]), general:  parseInt(cells[18 + 2]),
-					basic:    parseInt(cells[18 + 3]), practice: parseInt(cells[18 + 4]), research: parseInt(cells[18 + 5]),
-					totalRequired: parseInt(cells[18 + 6]), totalSelected: parseInt(cells[18 + 7]), total: parseInt(cells[18 + 8])
-				}
-			})
-		"#).and_then(|x| serde_json::from_str(&x.assume_string()).map_err(From::from))
+		let query_text_content = jsqCustomExpr!([jsq::types::String] "x.textContent.trim()").into_closure("x");
+		self.remote.query_value(rctx, &jsq::Document.query_selector_all("#dgrdSotsugyoYoken tr.text-main td:not(:first-child)".into()).map(query_text_content)
+			.map_value_auto("cells", jsqGenObject!{
+				requirements: &jsqGenObject!{
+					intercom: "parseInt(cells[0])", selfdev:  "parseInt(cells[1])", general:  "parseInt(cells[2])",
+					basic:    "parseInt(cells[3])", practice: "parseInt(cells[4])", research: "parseInt(cells[5])",
+					totalRequired: "parseInt(cells[6])", totalSelected: "parseInt(cells[7])", total: "0"
+				}.to_string(),
+				mastered: &jsqGenObject!{
+					intercom: "parseInt(cells[9 + 0])", selfdev:  "parseInt(cells[9 + 1])", general:  "parseInt(cells[9 + 2])",
+					basic:    "parseInt(cells[9 + 3])", practice: "parseInt(cells[9 + 4])", research: "parseInt(cells[9 + 5])",
+					totalRequired: "parseInt(cells[9 + 6])", totalSelected: "parseInt(cells[9 + 7])", total: "parseInt(cells[9 + 8])"
+				}.to_string(),
+				current: &jsqGenObject!{
+					intercom: "parseInt(cells[18 + 0])", selfdev:  "parseInt(cells[18 + 1])", general:  "parseInt(cells[18 + 2])",
+					basic:    "parseInt(cells[18 + 3])", practice: "parseInt(cells[18 + 4])", research: "parseInt(cells[18 + 5])",
+					totalRequired: "parseInt(cells[18 + 6])", totalSelected: "parseInt(cells[18 + 7])", total: "parseInt(cells[18 + 8])"
+				}.to_string()
+			}).stringify().to_string()).and_then(|x| serde_json::from_str(&x.assume_string()).map_err(From::from))
 	}
 }
 /// 学生プロファイル
@@ -641,6 +757,22 @@ impl CampusPlanAttendanceDetailsFrames
 	pub fn parse_current_year_table(&mut self) -> GenericResult<Vec<SubjectAttendanceState>>
 	{
 		let rctx = Some(self.main_frame_context());
+		let cells = jsq::Document.query_selector_all(format!("#{} tr:not(:first-child) td", Self::TABLE_ID))
+			.map_auto("x", jsqCustomExpr!([jsq::types::String] "x.textContent.trim()"));
+		let objgen = jsqGenObject!{
+			code: "cells[i + 0]", name: "cells[i + 1]", period: "toPeriod(cells[i + 2])", week: "toWeekName(cells[i + 3])",
+			// 半角にしてからparseInt
+			time: "parseInt(cells[i + 4].replace(/[０-９]/g, x => String.fromCharCode(x.charCodeAt(0) - 65248)))",
+			rate: "parseFloat(cells[i + 5])", states: r#"cells.slice(i + 6, i + 6 + 15).map(x =>
+			{
+				if(!x) return [0, 0, "NoData"];
+				var date = x.match(/(\d+)\/(\d+)/);
+				if(x.includes("公認欠席"))  return [parseInt(date[1]), parseInt(date[2]), "Authorized"];
+				else if(x.includes("欠席")) return [parseInt(date[1]), parseInt(date[2]), "Absence"];
+				else if(x.includes("出席")) return [parseInt(date[1]), parseInt(date[2]), "Presence"];
+				else return [parseInt(date[1]), parseInt(date[2]), "NoData"];
+			})"#
+		};
 		self.remote.query_value(rctx, &format!(r#"
 			{}
 			function toWeekName(s)
@@ -653,46 +785,26 @@ impl CampusPlanAttendanceDetailsFrames
 				}}
 			}}
 
-			var table = document.getElementById({:?});
-			var cells = Array.prototype.map.call(table.querySelectorAll("tr:not(:first-child) td"), x => x.textContent.trim());
+			let cells = {};
 			var subjects = [];
-			for(var i = 0; i < cells.length; i += 15 + 6)
-			{{
-				subjects.push({{
-					code: cells[i + 0], name: cells[i + 1], period: toPeriod(cells[i + 2]), week: toWeekName(cells[i + 3]),
-					// 半角にしてからparseInt
-					time: parseInt(cells[i + 4].substring(cells[i + 4].search(/\d+/)).replace(/[０-ｚ]/g,
-						x => String.fromCharCode(x.charCodeAt(0) - 65248))),
-					rate: parseFloat(cells[i + 5].substring(cells[i + 5].search(/\d+(\.\d+)?/))),
-					states: cells.slice(i + 6, i + 6 + 15).map(x =>
-					{{
-						if(!x) return [0, 0, "NoData"];
-						var date = x.match(/(\d+)\/(\d+)/);
-						if(x.includes("公認欠席"))  return [parseInt(date[1]), parseInt(date[2]), "Authorized"];
-						else if(x.includes("欠席")) return [parseInt(date[1]), parseInt(date[2]), "Absence"];
-						else if(x.includes("出席")) return [parseInt(date[1]), parseInt(date[2]), "Presence"];
-						else return [parseInt(date[1]), parseInt(date[2]), "NoData"];
-					}})
-				}});
-			}}
+			for(var i = 0; i < cells.length; i += 15 + 6) subjects.push({});
 			JSON.stringify(subjects)
-		"#, Self::COMMONCODE, Self::TABLE_ID)).and_then(|s| serde_json::from_str(&s.assume_string()).map_err(From::from))
+		"#, Self::COMMONCODE, cells, objgen)).and_then(|s| serde_json::from_str(&s.assume_string()).map_err(From::from))
 	}
 	/// 期間別出席率テーブルの取得
 	pub fn parse_attendance_rates(&mut self) -> GenericResult<Vec<PeriodAttendanceRate>>
 	{
 		let rctx = Some(self.main_frame_context());
-		self.remote.query_value(rctx, &format!(r#"
-			{}
-			var table = document.getElementById({:?});
-			var cells = Array.prototype.map.call(table.querySelectorAll("tr:not(:first-child) td"), x => x.textContent.trim());
-			var ret = [];
-			for(var i = 0; i < cells.length; i += 3) {{
-				var row = cells.slice(i, i + 3);
-				ret.push({{firstYear: parseInt(row[0]), startingPeriod: toPeriod(row[1]), rates: parseFloat(row[2].substring(row[2].search(/\d+(\.\d+)?/)))}});
-			}}
+		let q_cells = jsq::Document.query_selector_all(format!("#{} tr:not(:first-child) td", Self::BY_PERIOD_TABLE_ID))
+			.map_auto("x", jsqCustomExpr!([jsq::types::String] "x.textContent.trim()"));
+		let q_objcon = jsqGenObject!{ firstYear: "parseInt(row[0])", startingPeriod: "toPeriod(row[1])", rates: "parseFloat(row[2])" }
+			.into_closure("row");
+		let q: String = self.remote.query_value(rctx, &format!(r#"{}
+			let cells2 = {}; var ret = [];
+			for(var i = 0; i < cells2.length; i += 3) ret.push(({})(cells2.slice(i, i + 3)));
 			JSON.stringify(ret)
-		"#, Self::COMMONCODE, Self::BY_PERIOD_TABLE_ID)).and_then(|x| serde_json::from_str(&x.assume_string()).map_err(From::from))
+		"#, Self::COMMONCODE, q_cells, q_objcon))?.assume();
+		Ok(serde_json::from_str(&q).expect("Protocol Corruption"))
 	}
 }
 /// 出欠テーブル: 科目行
