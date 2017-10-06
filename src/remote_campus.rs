@@ -6,7 +6,7 @@ use {headless_chrome, GenericResult};
 use headless_chrome::{Event, RequestID};
 use std::net::TcpStream;
 use serde_json;
-use serde_json::{Value as JValue, Map as JMap};
+use serde_json::Value as JValue;
 use std::marker::PhantomData;
 use std::mem::{replace, transmute};
 use chrono::prelude::*;
@@ -16,26 +16,20 @@ use headless_chrome::runtime::JSONTyping;
 use jsquery as jsq;
 use jsquery::QueryCombinator;
 
-pub trait QueryValueType<T: Sized>: Sized { fn unwrap(self) -> T; }
-impl QueryValueType<JMap<String, JValue>> for JValue
-{
-	fn unwrap(self) -> JMap<String, JValue> { jvDecomposite!{ self => object[v]: v } }
-}
-impl QueryValueType<Vec<JValue>> for JValue
-{
-	fn unwrap(self) -> Vec<JValue> { jvDecomposite!{ self => array[v]: v } }
-}
-impl QueryValueType<String> for JValue { fn unwrap(self) -> String { jvDecomposite!{ self => string[v]: v } } }
-
 pub struct RemoteCampus { session: headless_chrome::Session<TcpStream, TcpStream>, request_id: RequestID }
 impl RemoteCampus
 {
-	pub fn connect(addr: &str) -> GenericResult<Self>
+	pub fn connect(addr: &str, ua_override: Option<&str>) -> GenericResult<Self>
 	{
 		let mut object = headless_chrome::Session::connect(addr).map(|session| RemoteCampus { session, request_id: 1 })?;
 		object.session.page().enable(0)?; object.session.wait_result(0)?;
 		object.session.dom().enable(0)?; object.session.wait_result(0)?;
 		object.session.runtime().enable(0)?; object.session.wait_result(0)?;
+		if let Some(ua) = ua_override
+		{
+			object.session.network().set_user_agent_override(0, ua)?;
+			object.session.wait_result(0)?;
+		}
 		Ok(object)
 	}
 	fn new_request_id(&mut self) -> RequestID

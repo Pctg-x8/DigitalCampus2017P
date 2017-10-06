@@ -1,10 +1,10 @@
 [package]
-name = "digitalCampusScraper"
+name = "dc_web"
 version = "0.1.0"
 authors = ["S.Percentage <Syn.Tri.Naga@gmail.com>"]
 
 [features]
-verbose = []
+verbose = ["colored"]
 
 [dependencies]
 tokio-core = "0.1"
@@ -18,7 +18,7 @@ websocket = "0.20"
 regex = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 
-colored = "1.5"
+colored = { version = "~1.5", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 termios = "0.2"
@@ -26,3 +26,6 @@ termios = "0.2"
 [target.'cfg(windows)'.dependencies]
 winapi = "0.2"
 kernel32-sys = "0.2"
+
+[dev-dependencies]
+colored = "1.5"

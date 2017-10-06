@@ -37,6 +37,15 @@ pub struct BrowserVersion<'s>
 	pub v8_version: &'s str
 }
 
+/// `json` response(session list)
+#[derive(Deserialize)] #[serde(rename_all = "camelCase")]
+pub struct SessionInfo<'s>
+{
+	pub description: &'s str, pub id: &'s str, pub title: &'s str,
+	#[serde(rename = "type")]
+	pub _type: &'s str, pub url: &'s str, pub web_socket_debugger_url: Option<&'s str>
+}
+
 struct DummyIterator;
 impl Iterator for DummyIterator
 {
@@ -101,6 +110,7 @@ impl<W: Write, R: Read> Session<W, R>
 {
 	pub fn dom(&mut self) -> domain::DOM<W, R> { domain::DOM(self) }
 	pub fn input(&mut self) -> domain::Input<W, R> { domain::Input(self) }
+	pub fn network(&mut self) -> domain::Network<W, R> { domain::Network(self) }
 	pub fn page(&mut self) -> domain::Page<W, R> { domain::Page(self) }
 	pub fn runtime(&mut self) -> domain::Runtime<W, R> { domain::Runtime(self) }
 }
@@ -532,6 +542,16 @@ pub mod domain
 		pub fn dispatch_key_event_sync(&mut self, id: RequestID, etype: super::input::KeyEvent, text: Option<&str>) -> super::GenericResult<()>
 		{
 			self.dispatch_key_event(id, etype, text).map_err(From::from).and_then(|_| self.0.wait_result(id)).map(|_| ())
+		}
+	}
+	pub struct Network<'c, W: Write + 'c, R: Read + 'c>(pub &'c mut Session<W, R>);
+	impl<'c, W: Write + 'c, R: Read + 'c> Network<'c, W, R>
+	{
+		pub fn set_user_agent_override(&mut self, id: RequestID, ua: &str) -> WebSocketResult<()>
+		{
+			#[derive(Serialize)] struct Payload<'s> { method: &'static str, id: RequestID, params: Params<'s> }
+			#[derive(Serialize)] #[serde(rename_all = "camelCase")] struct Params<'s> { user_agent: &'s str }
+			self.0.send(&Payload { method: "Network.setUserAgentOverride", id, params: Params { user_agent: ua } })
 		}
 	}
 	pub struct Page<'c, W: Write + 'c, R: Read + 'c>(pub &'c mut Session<W, R>);

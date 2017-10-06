@@ -1,66 +1,25 @@
 
 #![feature(iterator_step_by, box_syntax, const_fn)]
 
+extern crate dc_web;
 extern crate tokio_core;
+extern crate serde_json;
 extern crate hyper;
 extern crate futures;
 extern crate json_flex;
 extern crate websocket;
-extern crate serde;
-#[macro_use]
-extern crate serde_derive;
-extern crate serde_json;
-extern crate chrono;
 extern crate colored;
 
 use tokio_core::reactor::Core;
 use futures::{Future, Stream};
 use std::io::prelude::*;
-use std::error::Error;
 use json_flex::Unwrap;
 use std::collections::HashMap;
 
-macro_rules! api_corruption
-{
-	(value_type) => (panic!("Unexpected value type returned. the API may be corrupted"));
-	(invalid_format) => (panic!("Invalid JSON format. the API may be corrupted"))
-}
-macro_rules! jvDecomposite
-{
-	{ $v: expr => object[$inner: pat]: $e: expr } =>
-	{
-		match $v { JValue::Object($inner) => $e, _ => api_corruption!(value_type) }
-	};
-	{ $v: expr => array[$inner: pat]: $e: expr } =>
-	{
-		match $v { JValue::Array($inner) => $e, _ => api_corruption!(value_type) }
-	};
-	{ $v: expr => string[$inner: pat]: $e: expr } =>
-	{
-		match $v { JValue::String($inner) => $e, _ => api_corruption!(value_type) }
-	};
-	{ $v: expr => opt object[$inner: pat]: $e: expr } =>
-	{
-		match $v { Some(JValue::Object($inner)) => $e, _ => api_corruption!(value_type) }
-	};
-	{ $v: expr => opt array[$inner: pat]: $e: expr } =>
-	{
-		match $v { Some(JValue::Array($inner)) => $e, _ => api_corruption!(value_type) }
-	};
-	{ $v: expr => opt string[$inner: pat]: $e: expr } =>
-	{
-		match $v { Some(JValue::String($inner)) => $e, _ => api_corruption!(value_type) }
-	};
-}
+use dc_web::headless_chrome::{Process as ChromeProcess, BrowserVersion, page, SessionInfo as ChromeSessionInfo};
+use dc_web::{RemoteCampus, HomeMenuControl, NotificationListPage};
 
-type GenericResult<T> = Result<T, Box<Error>>;
-
-mod headless_chrome;
-#[macro_use] mod jsquery;
-mod remote_campus;
-use remote_campus::{RemoteCampus, HomeMenuControl, NotificationListPage};
-
-fn process_login(mut pctrl: remote_campus::LoginPage) -> remote_campus::HomePage
+fn process_login(mut pctrl: dc_web::LoginPage) -> dc_web::HomePage
 {
 	// Logging-in required
 	// let id = prompt("Student Number");
@@ -77,7 +36,7 @@ fn process_login(mut pctrl: remote_campus::LoginPage) -> remote_campus::HomePage
 	})
 }
 
-fn frame_navigated(e: &headless_chrome::page::FrameNavigated)
+fn frame_navigated(e: &page::FrameNavigated)
 {
 	use colored::*;
 
@@ -91,27 +50,30 @@ fn main()
 
 	let autologin = std::env::args().nth(1).map(|s| s.split(":").map(ToOwned::to_owned).collect::<Vec<String>>());
 
-	let chrome = headless_chrome::Process::run(9222, "https://dh.force.com/digitalCampus/campusHomepage").expect("Failed to launch the Headless Chrome");
+	let chrome = ChromeProcess::run(9222, "https://dh.force.com/digitalCampus/campusHomepage").expect("Failed to launch the Headless Chrome");
 
 	let mut tcore = Core::new().expect("Failed to initialize tokio-core");
 	let client = hyper::Client::new(&tcore.handle());
-	{
+	let ua_dc2017 = {
 		let received = String::from_utf8_lossy(&tcore.run(chrome.get_version_async(&client).and_then(|res| res.body().concat2())).unwrap()).into_owned();
-		let version_info: headless_chrome::BrowserVersion = serde_json::from_str(&received).unwrap();
+		let version_info: BrowserVersion = serde_json::from_str(&received).unwrap();
 		println!("Headless Chrome: {} :: {}", version_info.browser, version_info.protocol_version);
 		println!("  webkit: {}", version_info.webkit_version);
 		println!("  user-agent: {}", version_info.user_agent);
-	}
-	let session_list: Vec<String> = 
+
+		// Create UA String
+		format!("DigitalCampus2017 w/ {}", version_info.user_agent)
+	};
+	let data =
 	{
 		let buffer = tcore.run(chrome.get_sessions_async(&client).and_then(|res| res.body().concat2())).unwrap();
-		let list_js: Vec<_> = json_flex::decode(String::from_utf8_lossy(&buffer).into_owned()).unwrap();
-		list_js.into_iter()
-			.map(|x| Unwrap::<HashMap<_, _>>::unwrap(x).remove("webSocketDebuggerUrl").unwrap().unwrap()).collect()
+		String::from_utf8_lossy(&buffer).into_owned()
 	};
+	let list_js: Vec<ChromeSessionInfo> = serde_json::from_str(&data).unwrap();
+	let main_session = list_js[0].web_socket_debugger_url.unwrap();
 
-	println!("Connecting {}...", session_list[0]);
-	let mut dc = RemoteCampus::connect(&session_list[0]).expect("Failed to connect to a session in the Headless Chrome");
+	println!("Connecting {}...", main_session);
+	let mut dc = RemoteCampus::connect(main_session, Some(&ua_dc2017)).expect("Failed to connect to a session in the Headless Chrome");
 	println!("  Connection established.");
 	dc.subscribe_frame_navigated(&frame_navigated);
 	let mut pctrl = dc.check_login_completion().expect("Failed waiting initial login completion").unwrap_or_else(move |mut e|
@@ -150,9 +112,10 @@ fn main()
 			.find(|x| x["url"].unwrap_string().contains("/CplanMenuWeb/"))
 			.map(|x| Unwrap::<HashMap<_, _>>::unwrap(x).remove("webSocketDebuggerUrl").unwrap().unwrap())
 	}.expect("Unable to find internal system session");
-	let mut dc_intersys = RemoteCampus::connect(&intersys_session_url).expect("Failed to connect to a internal system session in the Headless Chrome");
+	let mut dc_intersys = RemoteCampus::connect(&intersys_session_url, Some(&ua_dc2017))
+		.expect("Failed to connect to a internal system session in the Headless Chrome");
 	dc_intersys.subscribe_frame_navigated(&frame_navigated);
-	let mut intersysmenu = unsafe { remote_campus::CampusPlanEntryFrames::enter(dc_intersys) };
+	let mut intersysmenu = unsafe { dc_web::CampusPlanEntryFrames::enter(dc_intersys) };
 	intersysmenu.wait_frame_context(true).unwrap();
 
 	// 学生プロファイルと履修科目テーブル
