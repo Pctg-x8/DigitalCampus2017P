@@ -6,15 +6,12 @@ extern crate tokio_core;
 extern crate serde_json;
 extern crate hyper;
 extern crate futures;
-extern crate json_flex;
 extern crate websocket;
 extern crate colored;
 
 use tokio_core::reactor::Core;
 use futures::{Future, Stream};
 use std::io::prelude::*;
-use json_flex::Unwrap;
-use std::collections::HashMap;
 
 use dc_web::headless_chrome::{Process as ChromeProcess, BrowserVersion, page, SessionInfo as ChromeSessionInfo};
 use dc_web::{RemoteCampus, HomeMenuControl, NotificationListPage};
@@ -103,15 +100,16 @@ fn main()
 	println!("{:?}", all_notifications.acquire_notifications().unwrap());
 
 	all_notifications.access_intersys_blank().unwrap();
-	let intersys_session_url: String = 
+	println!("** Switching Session **");
+	let data =
 	{
 		let buffer = tcore.run(chrome.get_sessions_async(&client).and_then(|res| res.body().concat2())).unwrap();
-		let list_js: Vec<_> = json_flex::decode(String::from_utf8_lossy(&buffer).into_owned()).unwrap();
-		println!("Sessions: {:?}", list_js);
-		list_js.into_iter()
-			.find(|x| x["url"].unwrap_string().contains("/CplanMenuWeb/"))
-			.map(|x| Unwrap::<HashMap<_, _>>::unwrap(x).remove("webSocketDebuggerUrl").unwrap().unwrap())
-	}.expect("Unable to find internal system session");
+		String::from_utf8_lossy(&buffer).into_owned()
+	};
+	let list_js: Vec<ChromeSessionInfo> = serde_json::from_str(&data).unwrap();
+	let intersys_session_url = list_js.into_iter().find(|x| x.url.contains("/CplanMenuWeb/"))
+		.and_then(|x| x.web_socket_debugger_url)
+		.expect("Unable to find internal system session");
 	let mut dc_intersys = RemoteCampus::connect(&intersys_session_url, Some(&ua_dc2017))
 		.expect("Failed to connect to a internal system session in the Headless Chrome");
 	dc_intersys.subscribe_frame_navigated(&frame_navigated);

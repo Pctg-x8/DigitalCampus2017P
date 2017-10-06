@@ -2,7 +2,6 @@
 
 extern crate hyper; extern crate futures;
 extern crate websocket;
-extern crate json_flex;
 extern crate serde; extern crate serde_json;
 #[macro_use] extern crate serde_derive;
 extern crate chrono;
