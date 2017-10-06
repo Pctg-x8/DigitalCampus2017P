@@ -27,19 +27,12 @@ impl QueryValueType<Vec<JValue>> for JValue
 }
 impl QueryValueType<String> for JValue { fn unwrap(self) -> String { jvDecomposite!{ self => string[v]: v } } }
 
-fn frame_navigated(e: &page::FrameNavigated)
-{
-	if let Some(n) = e.frame.name.as_ref() { println!("FrameNavigated: {} in {}", e.frame.url, n); }
-	else { println!("FrameNavigated: {}", e.frame.url); }
-}
-
 pub struct RemoteCampus { session: headless_chrome::Session<TcpStream, TcpStream>, request_id: RequestID }
 impl RemoteCampus
 {
 	pub fn connect(addr: &str) -> GenericResult<Self>
 	{
 		let mut object = headless_chrome::Session::connect(addr).map(|session| RemoteCampus { session, request_id: 1 })?;
-		object.session.subscribe_session_event(&frame_navigated);
 		object.session.page().enable(0)?; object.session.wait_result(0)?;
 		object.session.dom().enable(0)?; object.session.wait_result(0)?;
 		object.session.runtime().enable(0)?; object.session.wait_result(0)?;
@@ -48,6 +41,10 @@ impl RemoteCampus
 	fn new_request_id(&mut self) -> RequestID
 	{
 		let r = self.request_id; self.request_id += 1; r
+	}
+	pub fn subscribe_frame_navigated<S: headless_chrome::FrameNavigatedEventSubscriber>(&mut self, subscriber: &'static S)
+	{
+		self.session.subscribe_session_event(subscriber);
 	}
 
 	pub fn query(&mut self, context: Option<u64>, expression: &str) -> GenericResult<()>
@@ -189,23 +186,64 @@ pub trait ToplevelPageControl
 	/// コントロール奪取
 	fn transfer_control(self) -> RemoteCampus;
 }
-pub trait IntersysAccessible : ToplevelPageControl + Sized
+/// ホームページのメインメニュー操作
+pub trait HomeMenuControl : ToplevelPageControl + Sized
 {
 	const INTERSYS_LINK_PATH: &'static str = "#gnav ul li.menuBlock ul li:first-child a";
+	const NOTIFICATIONS_LINK_PATH: &'static str = "#gnav ul li:nth-child(2) a";
+	const LECTURE_CATEGORY_LINKS_PATH: &'static str = "#gnav ul li:nth-child(3) ul li a";
 
 	/// "履修・成績・出席"リンクへ
 	/// 将来的にmenuBlockクラスが複数出てきたらまた考えます
 	fn access_intersys(mut self) -> GenericResult<CampusPlanEntryFrames>
 	{
 		self.remote_ctrl().jump_to_anchor_href(Self::INTERSYS_LINK_PATH)?;
-		let mut r = CampusPlanFrames::enter(self.transfer_control());
+		let mut r = unsafe { CampusPlanFrames::enter(self.transfer_control()) };
 		r.wait_frame_context(true)?; Ok(r)
 	}
 	/// "履修・成績・出席"リンクへ(別セッションで立ち上がる)
 	/// 将来的にmenuBlockクラスが複数出てきたらまた考えます
 	fn access_intersys_blank(&mut self) -> GenericResult<()>
 	{
-		self.remote_ctrl().click_element(None, Self::INTERSYS_LINK_PATH)
+		self.remote_ctrl().click_element(None, Self::INTERSYS_LINK_PATH).map(drop)
+	}
+
+	/// すべてのお知らせが見れるページに飛ぶ
+	fn access_all_notifications(mut self) -> GenericResult<AllNotificationsPage>
+	{
+		// self.remote.jump_to_anchor_href(&format!("{}:nth-child(1) {}", Self::NEWSBOX_LIST, Self::TOALL_LINK_PATH))?.wait_loading()?;
+		self.remote_ctrl().click_element(None, Self::NOTIFICATIONS_LINK_PATH)?.wait_loading()?;
+		Ok(AllNotificationsPage { remote: self.transfer_control() })
+	}
+	/// すべての休講・補講・教室変更一覧が見れるページに飛ぶ
+	fn access_all_class_notifications(mut self) -> GenericResult<AllClassNotificationsPage>
+	{
+		self.remote_ctrl().click_nth_element(None, Self::LECTURE_CATEGORY_LINKS_PATH, 1)?.wait_loading()?;
+		Ok(AllClassNotificationsPage { remote: self.transfer_control() })
+	}
+	/// すべての回答待ちフィードバックシート一覧が見れるページに飛ぶ
+	fn access_all_feedback_sheets(mut self) -> GenericResult<AllFeedbackSheetNotificationsPage>
+	{
+		self.remote_ctrl().click_nth_element(None, Self::LECTURE_CATEGORY_LINKS_PATH, 2)?.wait_loading()?;
+		Ok(AllFeedbackSheetNotificationsPage { remote: self.transfer_control() })
+	}
+	/// すべての回答待ち課題一覧が見れるページに飛ぶ
+	fn access_all_homeworks(mut self) -> GenericResult<AllHomeworkNotificationsPage>
+	{
+		self.remote_ctrl().click_nth_element(None, Self::LECTURE_CATEGORY_LINKS_PATH, 3)?.wait_loading()?;
+		Ok(AllHomeworkNotificationsPage { remote: self.transfer_control() })
+	}
+	/// すべての授業資料一覧が見れるページに飛ぶ
+	fn access_all_lecture_notes(mut self) -> GenericResult<AllLectureNotesPage>
+	{
+		self.remote_ctrl().click_nth_element(None, Self::LECTURE_CATEGORY_LINKS_PATH, 4)?.wait_loading()?;
+		Ok(AllLectureNotesPage { remote: self.transfer_control() })
+	}
+	/// すべての授業関連の連絡一覧が見れるページに飛ぶ
+	fn access_all_lecture_notifications(mut self) -> GenericResult<AllLectureNotificationsPage>
+	{
+		self.remote_ctrl().click_nth_element(None, Self::LECTURE_CATEGORY_LINKS_PATH, 5)?.wait_loading()?;
+		Ok(AllLectureNotificationsPage { remote: self.transfer_control() })
 	}
 }
 impl ToplevelPageControl for HomePage
@@ -236,18 +274,17 @@ impl ToplevelPageControl for AllHomeworkNotificationsPage
 {
 	fn remote_ctrl(&mut self) -> &mut RemoteCampus { &mut self.remote } fn transfer_control(self) -> RemoteCampus { self.remote }
 }
-impl IntersysAccessible for HomePage {}
-impl IntersysAccessible for AllNotificationsPage {}
-impl IntersysAccessible for AllClassNotificationsPage {}
-impl IntersysAccessible for AllLectureNotesPage {}
-impl IntersysAccessible for AllLectureNotificationsPage {}
-impl IntersysAccessible for AllFeedbackSheetNotificationsPage {}
-impl IntersysAccessible for AllHomeworkNotificationsPage {}
+impl HomeMenuControl for HomePage {}
+impl HomeMenuControl for AllNotificationsPage {}
+impl HomeMenuControl for AllClassNotificationsPage {}
+impl HomeMenuControl for AllLectureNotesPage {}
+impl HomeMenuControl for AllLectureNotificationsPage {}
+impl HomeMenuControl for AllFeedbackSheetNotificationsPage {}
+impl HomeMenuControl for AllHomeworkNotificationsPage {}
 
 /// トップコンテンツ取得
 impl HomePage
 {
-	const MAINCONTENTS_ID: &'static str = "mainContents";
 	const NEWSBOX_LIST: &'static str = "#mainContents .homeNewsBox";
 	const NEWSBOX_CONTENT_ROWS: &'static str = "table:nth-child(2) tr.pointer";
 	const TOALL_LINK_PATH: &'static str = ".toAll a";
@@ -294,13 +331,6 @@ impl HomePage
 			})).stringify().with_header(Self::COMMONFN_TRANSLATE_NS))?.assume();
 		Ok(serde_json::from_str(&q).expect("Protocol Corruption"))
 	}
-	/// すべてのお知らせが見れるページに飛ぶ
-	pub fn access_all_notifications(mut self) -> GenericResult<AllNotificationsPage>
-	{
-		// self.remote.jump_to_anchor_href(&format!("{}:nth-child(1) {}", Self::NEWSBOX_LIST, Self::TOALL_LINK_PATH))?.wait_loading()?;
-		self.remote.click_element(None, &format!("{}:nth-child(1) {}", Self::NEWSBOX_LIST, Self::TOALL_LINK_PATH))?.wait_loading()?;
-		Ok(AllNotificationsPage { remote: self.remote })
-	}
 	/// 授業関連の最新のお知らせ(〜3件?)を取得
 	pub fn acquire_lecture_notifications_latest(&mut self) -> GenericResult<Vec<ClassNotification>>
 	{
@@ -310,24 +340,6 @@ impl HomePage
 				state: "translateNotificationState(cells[5])", onClickScript: r#"r.getAttribute("onclick").substring("javascript:".length)"#
 			})).stringify().with_header(Self::COMMONFN_TRANSLATE_NS))?.assume();
 		Ok(serde_json::from_str(&q).expect("Protocol Corruption"))
-	}
-	/// すべての休講・補講・教室変更一覧が見れるページに飛ぶ
-	pub fn access_all_class_notifications(mut self) -> GenericResult<AllClassNotificationsPage>
-	{
-		self.remote.click_nth_element(None, &format!("{}:nth-child(2) {}", Self::NEWSBOX_LIST, Self::TOALL_LINK_PATH), 0)?.wait_loading()?;
-		Ok(AllClassNotificationsPage { remote: self.remote })
-	}
-	/// すべての授業資料一覧が見れるページに飛ぶ
-	pub fn access_all_lecture_notes(mut self) -> GenericResult<AllLectureNotesPage>
-	{
-		self.remote.click_nth_element(None, &format!("{}:nth-child(2) {}", Self::NEWSBOX_LIST, Self::TOALL_LINK_PATH), 1)?.wait_loading()?;
-		Ok(AllLectureNotesPage { remote: self.remote })
-	}
-	/// すべての授業関連の連絡一覧が見れるページに飛ぶ
-	pub fn access_all_lecture_notifications(mut self) -> GenericResult<AllLectureNotificationsPage>
-	{
-		self.remote.click_nth_element(None, &format!("{}:nth-child(2) {}", Self::NEWSBOX_LIST, Self::TOALL_LINK_PATH), 2)?.wait_loading()?;
-		Ok(AllLectureNotificationsPage { remote: self.remote })
 	}
 	/// フィードバックシート回答待ちリストの取得
 	pub fn acquire_feedback_sheets(&mut self) -> GenericResult<Vec<FeedbackSheetNotification>>
@@ -341,12 +353,6 @@ impl HomePage
 			})).stringify().with_header(Self::COMMONFN_TRANSLATE_NS))?.assume();
 		Ok(serde_json::from_str(&q).expect("Protocol Corruption"))
 	}
-	/// すべての回答待ちフィードバックシート一覧が見れるページに飛ぶ
-	pub fn access_all_feedback_sheets(mut self) -> GenericResult<AllFeedbackSheetNotificationsPage>
-	{
-		self.remote.click_element(None, &format!("{}:nth-child(3) {}", Self::NEWSBOX_LIST, Self::TOALL_LINK_PATH))?.wait_loading()?;
-		Ok(AllFeedbackSheetNotificationsPage { remote: self.remote })
-	}
 	/// 課題回答待ちリストの取得
 	pub fn acquire_homeworks(&mut self) -> GenericResult<Vec<HomeworkNotification>>
 	{
@@ -357,12 +363,6 @@ impl HomePage
 				onClickScript: r#"r.getAttribute("onclick").substring("javascript:".length)"#
 			})).stringify().with_header(Self::COMMONFN_TRANSLATE_NS))?.assume();
 		Ok(serde_json::from_str(&q).expect("Protocol Corruption"))
-	}
-	/// すべての回答待ち課題一覧が見れるページに飛ぶ
-	pub fn access_all_homeworks(mut self) -> GenericResult<AllHomeworkNotificationsPage>
-	{
-		self.remote.click_element(None, &format!("{}:nth-child(4) {}", Self::NEWSBOX_LIST, Self::TOALL_LINK_PATH))?.wait_loading()?;
-		Ok(AllHomeworkNotificationsPage { remote: self.remote })
 	}
 }
 /// お知らせ一覧のページ
@@ -443,7 +443,7 @@ impl NotificationListPage for AllLectureNotificationsPage
 		}
 	}
 }
-const REFORMAT_DATETIME_CELLS_3: &'static str = r#"cells[3].replace(/(\d+)\/(\d+)\/(\d+)\s*(\d+:\d+)/, "$1-$2-$3T$4:00Z")"#;
+const REFORMAT_DATE_CELLS_3: &'static str = r#"cells[3].replace(/(\d+)\/(\d+)\/(\d+)/, "$1-$2-$3T00:00:00Z")"#;
 impl NotificationListPage for AllFeedbackSheetNotificationsPage
 {
 	type NotificationTy = FeedbackSheetNotification;
@@ -452,7 +452,7 @@ impl NotificationListPage for AllFeedbackSheetNotificationsPage
 		jsqGenObject!{
 			lectureDate: REFORMAT_DATE_CELLS_0, lectureTitle: "cells[1]",
 			time: "parseInt(cells[2].replace(/[０-９]/g, x => String.fromCharCode(x.charCodeAt(0) - 65248)))",
-			deadline: REFORMAT_DATETIME_CELLS_3, state: "translateNotificationState(cells[4])",
+			deadline: REFORMAT_DATE_CELLS_3, state: "translateNotificationState(cells[4])",
 			onClickScript: r#"r.getAttribute("onclick").substring("javascript:".length)"#
 		}
 	}
@@ -464,7 +464,7 @@ impl NotificationListPage for AllHomeworkNotificationsPage
 	{
 		jsqGenObject!{
 			date: REFORMAT_DATE_CELLS_0, lectureTitle: "cells[1]", title: "cells[2]",
-			deadline: REFORMAT_DATETIME_CELLS_3, state: "translateNotificationState(cells[4])",
+			deadline: REFORMAT_DATE_CELLS_3, state: "translateNotificationState(cells[4])",
 			onClickScript: r#"r.getAttribute("onclick").substring("javascript:".length)"#
 		}
 	}
@@ -617,7 +617,7 @@ pub struct CampusPlanFrames<MainFrameCtrlTy: PageControl, MenuFrameCtrlTy: PageC
 }
 impl<MainFrameCtrlTy: PageControl, MenuFrameCtrlTy: PageControl> CampusPlanFrames<MainFrameCtrlTy, MenuFrameCtrlTy>
 {
-	fn enter(remote: RemoteCampus) -> Self
+	pub unsafe fn enter(remote: RemoteCampus) -> Self
 	{
 		CampusPlanFrames { remote, ph: PhantomData, ctx_main_frame: ScriptContextState::Unloaded, ctx_menu_frame: ScriptContextState::Unloaded }
 	}
@@ -637,7 +637,7 @@ impl<MainFrameCtrlTy: PageControl, MenuFrameCtrlTy: PageControl> CampusPlanFrame
 impl<MainFrameCtrlTy: PageControl, MenuFrameCtrlTy: PageControl> CampusPlanFrames<MainFrameCtrlTy, MenuFrameCtrlTy>
 {
 	/// フレームのロードを待つ
-	fn wait_frame_context(&mut self, wait_for_menu_context: bool) -> GenericResult<&mut Self>
+	pub fn wait_frame_context(&mut self, wait_for_menu_context: bool) -> GenericResult<&mut Self>
 	{
 		let (mut main_completion, mut menu_completion) = (false, !wait_for_menu_context);
 
@@ -718,7 +718,7 @@ impl CampusPlanEntryFrames
 	{
 		let rctx = Some(self.main_frame_context());
 		self.remote.click_element(rctx, Self::COURSE_CATEGORY_LINK_ID)?;
-		let mut r = CampusPlanFrames::enter(self.remote);
+		let mut r = unsafe { CampusPlanFrames::enter(self.remote) };
 		r.wait_frame_context(true)?;
 		while r.is_blank_main()? { r.wait_frame_context(true)?; }
 		Ok(r)
@@ -729,7 +729,7 @@ impl CampusPlanEntryFrames
 	{
 		let rctx = Some(self.main_frame_context());
 		self.remote.click_element(rctx, Self::SYLLABUS_CATEGORY_LINK_ID)?;
-		let mut r = CampusPlanFrames::enter(self.remote);
+		let mut r = unsafe { CampusPlanFrames::enter(self.remote) };
 		r.wait_frame_context(true)?;
 		while r.is_blank_main()? { r.wait_frame_context(true)?; }
 		Ok(r)
@@ -739,7 +739,7 @@ impl CampusPlanEntryFrames
 	{
 		let rctx = Some(self.main_frame_context());
 		self.remote.click_element(rctx, Self::ATTENDANCE_CATEGORY_LINK_ID)?;
-		let mut r = CampusPlanFrames::enter(self.remote);
+		let mut r = unsafe { CampusPlanFrames::enter(self.remote) };
 		r.wait_frame_context(true)?;
 		while r.is_blank_main()? { r.wait_frame_context(true)?; }
 		Ok(r)

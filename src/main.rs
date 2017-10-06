@@ -11,13 +11,14 @@ extern crate serde;
 extern crate serde_derive;
 extern crate serde_json;
 extern crate chrono;
-
-#[cfg(feature = "verbose")] extern crate colored;
+extern crate colored;
 
 use tokio_core::reactor::Core;
 use futures::{Future, Stream};
 use std::io::prelude::*;
 use std::error::Error;
+use json_flex::Unwrap;
+use std::collections::HashMap;
 
 macro_rules! api_corruption
 {
@@ -57,7 +58,7 @@ type GenericResult<T> = Result<T, Box<Error>>;
 mod headless_chrome;
 #[macro_use] mod jsquery;
 mod remote_campus;
-use remote_campus::{RemoteCampus, IntersysAccessible, NotificationListPage};
+use remote_campus::{RemoteCampus, HomeMenuControl, NotificationListPage};
 
 fn process_login(mut pctrl: remote_campus::LoginPage) -> remote_campus::HomePage
 {
@@ -74,6 +75,14 @@ fn process_login(mut pctrl: remote_campus::LoginPage) -> remote_campus::HomePage
 		println!("** デジキャンへのログインに失敗しました。学籍番号またはパスワードが正しいか確認してください。 **");
 		process_login(e)
 	})
+}
+
+fn frame_navigated(e: &headless_chrome::page::FrameNavigated)
+{
+	use colored::*;
+
+	if let Some(n) = e.frame.name.as_ref() { println!("{} in {}", format!("FrameNavigated: {}", e.frame.url).bold(), n); }
+	else { println!("{}", format!("FrameNavigated: {}", e.frame.url).bold()); }
 }
 
 fn main()
@@ -96,13 +105,15 @@ fn main()
 	let session_list: Vec<String> = 
 	{
 		let buffer = tcore.run(chrome.get_sessions_async(&client).and_then(|res| res.body().concat2())).unwrap();
-		let list_js = json_flex::decode(String::from_utf8_lossy(&buffer).into_owned());
-		list_js.into_vec().expect("Expeting Array").into_iter().map(|x| x["webSocketDebuggerUrl"].unwrap_string().clone()).collect()
+		let list_js: Vec<_> = json_flex::decode(String::from_utf8_lossy(&buffer).into_owned()).unwrap();
+		list_js.into_iter()
+			.map(|x| Unwrap::<HashMap<_, _>>::unwrap(x).remove("webSocketDebuggerUrl").unwrap().unwrap()).collect()
 	};
 
 	println!("Connecting {}...", session_list[0]);
-	let dc = RemoteCampus::connect(&session_list[0]).expect("Failed to connect to a session in the Headless Chrome");
+	let mut dc = RemoteCampus::connect(&session_list[0]).expect("Failed to connect to a session in the Headless Chrome");
 	println!("  Connection established.");
+	dc.subscribe_frame_navigated(&frame_navigated);
 	let mut pctrl = dc.check_login_completion().expect("Failed waiting initial login completion").unwrap_or_else(move |mut e|
 	{
 		// println!("Logging-in required for DigitalCampus");
@@ -130,11 +141,19 @@ fn main()
 	println!("{:?}", all_notifications.acquire_notifications().unwrap());
 
 	all_notifications.access_intersys_blank().unwrap();
-
-	/*
-	// println!("履修ページへアクセスしています...");
-	let intersysmenu = all_notifications.access_intersys().unwrap();
-	// let mut intersysmenu = pctrl.jump_into_intersys().unwrap().isolate_mainframe().unwrap();
+	let intersys_session_url: String = 
+	{
+		let buffer = tcore.run(chrome.get_sessions_async(&client).and_then(|res| res.body().concat2())).unwrap();
+		let list_js: Vec<_> = json_flex::decode(String::from_utf8_lossy(&buffer).into_owned()).unwrap();
+		println!("Sessions: {:?}", list_js);
+		list_js.into_iter()
+			.find(|x| x["url"].unwrap_string().contains("/CplanMenuWeb/"))
+			.map(|x| Unwrap::<HashMap<_, _>>::unwrap(x).remove("webSocketDebuggerUrl").unwrap().unwrap())
+	}.expect("Unable to find internal system session");
+	let mut dc_intersys = RemoteCampus::connect(&intersys_session_url).expect("Failed to connect to a internal system session in the Headless Chrome");
+	dc_intersys.subscribe_frame_navigated(&frame_navigated);
+	let mut intersysmenu = unsafe { remote_campus::CampusPlanEntryFrames::enter(dc_intersys) };
+	intersysmenu.wait_frame_context(true).unwrap();
 
 	// 学生プロファイルと履修科目テーブル
 	let mut cdetails = intersysmenu.access_course_category().unwrap().access_details().unwrap();
@@ -148,7 +167,9 @@ fn main()
 	// let mut adetails = intersysmenu.access_attendance_category().unwrap().access_details().unwrap();
 	println!("{:?}", adetails.parse_current_year_table().unwrap());
 	println!("{:?}", adetails.parse_attendance_rates().unwrap());
-	*/
+
+	let mut feedback_sheets = all_notifications.access_all_feedback_sheets().unwrap();
+	println!("{:?}", feedback_sheets.acquire_notifications().unwrap());
 }
 
 fn prompt(text: &str) -> String

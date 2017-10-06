@@ -4,7 +4,7 @@ version = "0.1.0"
 authors = ["S.Percentage <Syn.Tri.Naga@gmail.com>"]
 
 [features]
-verbose = ["colored"]
+verbose = []
 
 [dependencies]
 tokio-core = "0.1"
@@ -18,7 +18,7 @@ websocket = "0.20"
 regex = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 
-colored = { version = "1.5", optional = true }
+colored = "1.5"
 
 [target.'cfg(unix)'.dependencies]
 termios = "0.2"
